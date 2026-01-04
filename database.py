@@ -360,13 +360,15 @@ async def create_referral(inviter_id: int, invited_id: int):
     now = int(time.time())
     async with db_connection() as db:
         try:
-            await db.execute(
+            cur = await db.execute(
                 "INSERT INTO referrals(inviter_id, invited_id, status, created_at) VALUES(?, ?, 'joined', ?)",
                 (inviter_id, invited_id, now)
             )
             await db.commit()
+            return True
         except Exception:
-            pass
+            # already exists or other error -> return False
+            return False
 
 
 async def mark_referral_verified(invited_id: int):
@@ -374,14 +376,21 @@ async def mark_referral_verified(invited_id: int):
     async with db_connection() as db:
         cur = await db.execute("SELECT status FROM referrals WHERE invited_id=?", (invited_id,))
         row = await cur.fetchone()
+        # If already verified — nothing to do
         if row and row[0] == "verified":
-            return
+            return False
 
-        await db.execute(
-            "UPDATE referrals SET status='verified', verified_at=? WHERE invited_id=?",
-            (now, invited_id)
-        )
-        await db.commit()
+        # If referral record exists — mark verified and return True
+        if row:
+            await db.execute(
+                "UPDATE referrals SET status='verified', verified_at=? WHERE invited_id=?",
+                (now, invited_id)
+            )
+            await db.commit()
+            return True
+
+        # No referral record — nothing to mark
+        return False
 
 
 async def count_verified_referrals(inviter_id: int) -> int:

@@ -16,7 +16,7 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
-from config import OWNER_ID, REQUIRED_CHANNELS_DEFAULT
+from config import OWNER_ID, OWNER2_ID, REQUIRED_CHANNELS_DEFAULT
 from database import (
     init_db, add_user, get_user, add_almaz, get_leaderboard,
     get_ref_by, set_ref_by_if_empty, is_verified, set_verified, set_phone_verified,
@@ -190,7 +190,14 @@ def format_user_short(name: str, username: Optional[str]) -> str:
 
 
 async def is_owner_or_admin(user_id: int) -> bool:
-    return user_id == OWNER_ID or await is_admin(user_id)
+    # True if user is either owner (OWNER_ID or OWNER2_ID) or an admin
+    if user_id == OWNER_ID or user_id == OWNER2_ID:
+        return True
+    return await is_admin(user_id)
+
+
+def is_owner(user_id: int) -> bool:
+    return user_id == OWNER_ID or user_id == OWNER2_ID
 
 
 async def get_referral_reward() -> int:
@@ -198,7 +205,7 @@ async def get_referral_reward() -> int:
     try:
         return int(v)
     except:
-        return 10
+        return 1
 
 
 # =================== MENUS ===================
@@ -409,7 +416,7 @@ async def notify_admins_about_withdraw(request_id: int):
         ]
     )
 
-    admin_ids = [OWNER_ID]
+    admin_ids = [OWNER_ID, OWNER2_ID]
     extra_admins = await list_admins()
     for uid, _ in extra_admins:
         if uid not in admin_ids:
@@ -480,28 +487,29 @@ async def cmd_start(message: Message, state: FSMContext):
             actual_ref = await get_ref_by(user_id)
             if actual_ref and actual_ref == ref_id:
                 try:
-                    await create_referral(ref_id, user_id)
+                    created = await create_referral(ref_id, user_id)
+                    # only notify inviter when a new referral record was actually created
+                    if created:
+                        try:
+                            invited_label = format_user_short(
+                                message.from_user.first_name,
+                                message.from_user.username
+                            )
+                            reward = await get_referral_reward()
 
-                    try:
-                        invited_label = format_user_short(
-                            message.from_user.first_name,
-                            message.from_user.username
-                        )
-                        reward = await get_referral_reward()
-
-                        await bot.send_message(
-                            ref_id,
-                            "🧲 <b>A’lo! Yangi foydalanuvchi jalb qilindi</b>\n\n"
-                            f"🎮 Siz taklif qilgan <b>{invited_label}</b> botga muvaffaqiyatli qo‘shildi.\n\n"
-                            "⏳ Endi faqat <b>2 ta qadam</b> qoldi:\n"
-                            "• Kanalga a’zo bo‘lish\n"
-                            "• Telefon raqamni tasdiqlash\n\n"
-                            f"💎 Ushbu jarayon yakunlangach, siz <b>{reward} Almaz</b>ga ega bo‘lasiz.\n"
-                            "⚡ Do‘stlaringiz harakati — sizning foydangiz!",
-                            parse_mode="HTML"
-                        )
-                    except Exception as e:
-                        log.warning("Referral 1-xabar error: %s", e)
+                            await bot.send_message(
+                                ref_id,
+                                "🧲 <b>A’lo! Yangi foydalanuvchi jalb qilindi</b>\n\n"
+                                f"🎮 Siz taklif qilgan <b>{invited_label}</b> botga muvaffaqiyatli qo‘shildi.\n\n"
+                                "⏳ Endi faqat <b>2 ta qadam</b> qoldi:\n"
+                                "• Kanalga a’zo bo‘lish\n"
+                                "• Telefon raqamni tasdiqlash\n\n"
+                                f"💎 Ushbu jarayon yakunlangach, siz <b>{reward} Almaz</b>ga ega bo‘lasiz.\n"
+                                "⚡ Do‘stlaringiz harakati — sizning foydangiz!",
+                                parse_mode="HTML"
+                            )
+                        except Exception as e:
+                            log.warning("Referral 1-xabar error: %s", e)
                 except Exception as e:
                     log.warning("Referral creation error: %s", e)
     else:
@@ -584,46 +592,46 @@ async def phone_contact_ok(message: Message, state: FSMContext):
     ref_by = await get_ref_by(user_id)
     # ---------------- 2-XABAR + BONUS (faqat 1 marta) ----------------
     if ref_by and ref_by != user_id:
-        # Step 1: Mark referral as verified (MUST happen first)
-        await mark_referral_verified(user_id)
+        # mark_referral_verified returns True only when we actually transitioned to verified
+        did_verify = await mark_referral_verified(user_id)
+        if did_verify:
+            # Step 2: Add Almaz reward (with error handling)
+            try:
+                reward = await get_referral_reward()
+                await add_almaz(ref_by, reward)
+            except Exception as e:
+                log.warning("Almaz qo'shishda xatolik: %s", e)
 
-        # Step 2: Add Almaz reward (with error handling)
-        try:
-            reward = await get_referral_reward()
-            await add_almaz(ref_by, reward)
-        except Exception as e:
-            log.warning("Almaz qo'shishda xatolik: %s", e)
+            # Step 3: Update rank (with error handling)
+            try:
+                await update_user_rank(ref_by, with_notification=True)
+            except Exception as e:
+                log.warning("Rank yangilashda xatolik: %s", e)
 
-        # Step 3: Update rank (with error handling)
-        try:
-            await update_user_rank(ref_by, with_notification=True)
-        except Exception as e:
-            log.warning("Rank yangilashda xatolik: %s", e)
+            # Step 4: Send 2nd message (SEPARATE try-catch to ensure it runs)
+            try:
+                total = await count_verified_referrals(ref_by)
+                invited_label = format_user_short(
+                    message.from_user.first_name or "Foydalanuvchi",
+                    message.from_user.username
+                )
 
-        # Step 4: Send 2nd message (SEPARATE try-catch to ensure it runs)
-        try:
-            total = await count_verified_referrals(ref_by)
-            invited_label = format_user_short(
-                message.from_user.first_name or "Foydalanuvchi",
-                message.from_user.username
-            )
+                txt = (
+                    "🎊 <b>Mukofot tayyor! Zo‘r ishladingiz</b>\n\n"
+                    f"✅ Siz taklif qilgan <b>{invited_label}</b> barcha tekshiruvlardan muvaffaqiyatli o‘tdi.\n\n"
+                    f"💎 Hisobingizga <b>{reward} Almaz</b> muvaffaqiyatli qo‘shildi!\n"
+                    f"👥 Tasdiqlangan takliflaringiz soni: <b>{total}</b>\n\n"
+                    "🔥 Qanchalik ko‘p do‘st taklif qilsangiz — shunchalik tez kuchli mukofotlarga yetasiz.\n"
+                    "🚀 Davom eting, imkoniyat siz tomonda!"
 
-            txt = (
-                "🎊 <b>Mukofot tayyor! Zo‘r ishladingiz</b>\n\n"
-                f"✅ Siz taklif qilgan <b>{invited_label}</b> barcha tekshiruvlardan muvaffaqiyatli o‘tdi.\n\n"
-                f"💎 Hisobingizga <b>{reward} Almaz</b> muvaffaqiyatli qo‘shildi!\n"
-                f"👥 Tasdiqlangan takliflaringiz soni: <b>{total}</b>\n\n"
-                "🔥 Qanchalik ko‘p do‘st taklif qilsangiz — shunchalik tez kuchli mukofotlarga yetasiz.\n"
-                "🚀 Davom eting, imkoniyat siz tomonda!"
+                )
 
-            )
+                await bot.send_message(ref_by, txt, parse_mode="HTML")
+                log.info(f"✅ 2-xabar muvaffaqiyatli yuborildi: {ref_by}")
 
-            await bot.send_message(ref_by, txt, parse_mode="HTML")
-            log.info(f"✅ 2-xabar muvaffaqiyatli yuborildi: {ref_by}")
-
-        except Exception as e:
-            # Even if message fails, Almaz is already added
-            log.error(f"❌ 2-xabar yuborishda xatolik (ref_by={ref_by}): {e}")
+            except Exception as e:
+                # Even if message fails, Almaz is already added
+                log.error(f"❌ 2-xabar yuborishda xatolik (ref_by={ref_by}): {e}")
 
     await state.clear()
 
@@ -1066,14 +1074,14 @@ async def withdraw_edit_send(message: Message, state: FSMContext):
 # ============== ADMIN PANEL ==============
 @dp.message(Command("admin"))
 async def admin_panel(message: Message):
-    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+    if not await is_owner_or_admin(message.from_user.id):
         return await message.answer("🚫 Siz admin emassiz.")
     await message.answer("👑 <b>Admin panel</b>", parse_mode="HTML", reply_markup=admin_menu)
 
 
 @dp.message(F.text == "📊 Foydalanuvchilar soni")
 async def user_count(message: Message):
-    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+    if not await is_owner_or_admin(message.from_user.id):
         return
     from database import DB_NAME
     import aiosqlite
@@ -1085,7 +1093,7 @@ async def user_count(message: Message):
 
 @dp.message(F.text == "📜 Isbotlar kanali")
 async def proof_channel_prompt(message: Message, state: FSMContext):
-    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+    if not await is_owner_or_admin(message.from_user.id):
         return
 
     current = await get_proof_channel_value()
@@ -1105,7 +1113,7 @@ async def proof_channel_prompt(message: Message, state: FSMContext):
 
 @dp.message(F.text == "⬅️ Orqaga", StateFilter(ProofChannelSetup.WAITING))
 async def proof_channel_cancel(message: Message, state: FSMContext):
-    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+    if not await is_owner_or_admin(message.from_user.id):
         return
     await state.clear()
     await message.answer("⏎ Isbotlar kanali sozlamalari bekor qilindi.", reply_markup=admin_menu)
@@ -1113,7 +1121,7 @@ async def proof_channel_cancel(message: Message, state: FSMContext):
 
 @dp.message(StateFilter(ProofChannelSetup.WAITING))
 async def proof_channel_save(message: Message, state: FSMContext):
-    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+    if not await is_owner_or_admin(message.from_user.id):
         return
     raw = (message.text or "").strip()
     try:
@@ -1141,7 +1149,7 @@ async def proof_channel_save(message: Message, state: FSMContext):
 
 @dp.message(F.text == "📰 Reklama/Yangilik sozlash")
 async def edit_news(message: Message, state: FSMContext):
-    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+    if not await is_owner_or_admin(message.from_user.id):
         return
     await state.set_state(TextEdit.new_text)
     await state.update_data(section="news")
@@ -1150,7 +1158,7 @@ async def edit_news(message: Message, state: FSMContext):
 
 @dp.message(F.text == "💰 Almaz sotib olish matni")
 async def edit_buy_text(message: Message, state: FSMContext):
-    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+    if not await is_owner_or_admin(message.from_user.id):
         return
     await state.set_state(TextEdit.new_text)
     await state.update_data(section="almaz_buy")
@@ -1159,7 +1167,7 @@ async def edit_buy_text(message: Message, state: FSMContext):
 
 @dp.message(F.text == "⬅️ Orqaga", StateFilter(TextEdit.new_text))
 async def cancel_text_edit(message: Message, state: FSMContext):
-    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+    if not await is_owner_or_admin(message.from_user.id):
         return
     await state.clear()
     await message.answer("⏎ O'zgartirish bekor qilindi.", reply_markup=admin_menu)
@@ -1167,7 +1175,7 @@ async def cancel_text_edit(message: Message, state: FSMContext):
 
 @dp.message(StateFilter(TextEdit.new_text))
 async def save_dynamic_text(message: Message, state: FSMContext):
-    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+    if not await is_owner_or_admin(message.from_user.id):
         return
     data = await state.get_data()
     section = data.get("section")
@@ -1186,7 +1194,7 @@ async def save_dynamic_text(message: Message, state: FSMContext):
 
 @dp.message(F.text == "📢 Reklama yuborish")
 async def ask_broadcast(message: Message, state: FSMContext):
-    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+    if not await is_owner_or_admin(message.from_user.id):
         return
     await message.answer("📢 Reklama xabarini yuboring (matn yoki media).", reply_markup=back_kb)
     await state.set_state(Broadcast.WAITING)
@@ -1194,7 +1202,7 @@ async def ask_broadcast(message: Message, state: FSMContext):
 
 @dp.message(F.text == "⬅️ Orqaga", StateFilter(Broadcast.WAITING))
 async def cancel_broadcast(message: Message, state: FSMContext):
-    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+    if not await is_owner_or_admin(message.from_user.id):
         return
     await state.clear()
     await message.answer("⏎ Reklama yuborish bekor qilindi.", reply_markup=admin_menu)
@@ -1208,7 +1216,7 @@ async def cancel_broadcast(message: Message, state: FSMContext):
     })
 )
 async def handle_broadcast(message: Message, state: FSMContext):
-    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+    if not await is_owner_or_admin(message.from_user.id):
         return
     await state.clear()
     await message.answer("🚀 Reklama yuborilmoqda… ⏳")
@@ -1236,7 +1244,7 @@ async def handle_broadcast(message: Message, state: FSMContext):
 
 @dp.message(F.text == "🧩 Majburiy kanallar")
 async def channels_menu(message: Message, state: FSMContext):
-    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+    if not await is_owner_or_admin(message.from_user.id):
         return
     channels = await list_required_channels()
     text = "🧩 <b>Majburiy kanallar</b>\n\n" + ("\n".join(f"• {ch}" for ch in channels) if channels else "– Hozircha kanal yo'q.")
@@ -1251,7 +1259,7 @@ async def channels_menu(message: Message, state: FSMContext):
 
 @dp.message(F.text == "➕ Kanal qo'shish")
 async def channel_add_prompt(message: Message, state: FSMContext):
-    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+    if not await is_owner_or_admin(message.from_user.id):
         return
     cnt = await required_channels_count()
     if cnt >= 6:
@@ -1263,7 +1271,7 @@ async def channel_add_prompt(message: Message, state: FSMContext):
 @dp.message(StateFilter(ChanManage.ADD))
 async def channel_add(message: Message, state: FSMContext):
     ch = (message.text or "").strip()
-    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+    if not await is_owner_or_admin(message.from_user.id):
         return
     if ch == "⬅️ Orqaga":
         await state.clear()
@@ -1280,7 +1288,7 @@ async def channel_add(message: Message, state: FSMContext):
 
 @dp.message(F.text == "➖ Kanal o'chirish")
 async def channel_remove_prompt(message: Message, state: FSMContext):
-    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+    if not await is_owner_or_admin(message.from_user.id):
         return
     await state.set_state(ChanManage.REMOVE)
     await message.answer("O'chirish uchun @username yoki -100... chat ID yuboring:", reply_markup=back_kb)
@@ -1289,7 +1297,7 @@ async def channel_remove_prompt(message: Message, state: FSMContext):
 @dp.message(StateFilter(ChanManage.REMOVE))
 async def channel_remove(message: Message, state: FSMContext):
     ch = (message.text or "").strip()
-    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+    if not await is_owner_or_admin(message.from_user.id):
         return
     if ch == "⬅️ Orqaga":
         await state.clear()
@@ -1304,7 +1312,7 @@ async def channel_remove(message: Message, state: FSMContext):
 
 @dp.message(F.text == "🛡 Admin boshqaruvi")
 async def admin_manage_menu(message: Message):
-    if message.from_user.id != OWNER_ID:
+    if not is_owner(message.from_user.id):
         return await message.answer("🚫 Bu bo'lim faqat egasi uchun.")
     admins = await list_admins()
     text = "🛡 <b>Adminlar ro'yxati:</b>\n" + ("\n".join(f"• @{u or 'unknown'} – <code>{uid}</code>" for uid, u in admins) if admins else "– Hech kim yo'q.")
@@ -1319,7 +1327,7 @@ async def admin_manage_menu(message: Message):
 
 @dp.message(F.text == "👤 Admin qo'shish")
 async def admin_add_prompt(message: Message, state: FSMContext):
-    if message.from_user.id != OWNER_ID:
+    if not is_owner(message.from_user.id):
         return
     await state.set_state(AdminManage.ADD)
     await message.answer("Admin qilish uchun foydalanuvchi ID yuboring:", reply_markup=back_kb)
@@ -1327,7 +1335,7 @@ async def admin_add_prompt(message: Message, state: FSMContext):
 
 @dp.message(StateFilter(AdminManage.ADD))
 async def admin_add_exec(message: Message, state: FSMContext):
-    if message.from_user.id != OWNER_ID:
+    if not is_owner(message.from_user.id):
         return
     if (message.text or "").strip() == "⬅️ Orqaga":
         await state.clear()
@@ -1342,7 +1350,7 @@ async def admin_add_exec(message: Message, state: FSMContext):
 
 @dp.message(F.text == "🗑 Adminni o'chirish")
 async def admin_remove_prompt(message: Message, state: FSMContext):
-    if message.from_user.id != OWNER_ID:
+    if not is_owner(message.from_user.id):
         return
     await state.set_state(AdminManage.REMOVE)
     await message.answer("O'chirish uchun admin ID yuboring:", reply_markup=back_kb)
@@ -1350,7 +1358,7 @@ async def admin_remove_prompt(message: Message, state: FSMContext):
 
 @dp.message(StateFilter(AdminManage.REMOVE))
 async def admin_remove_exec(message: Message, state: FSMContext):
-    if message.from_user.id != OWNER_ID:
+    if not is_owner(message.from_user.id):
         return
     if (message.text or "").strip() == "⬅️ Orqaga":
         await state.clear()
@@ -1665,7 +1673,7 @@ async def search_user_exec(message: Message, state: FSMContext):
 
 @dp.message(F.text == "⬅️ Chiqish")
 async def admin_exit_to_main(message: Message, state: FSMContext):
-    if message.from_user.id == OWNER_ID or await is_admin(message.from_user.id):
+    if await is_owner_or_admin(message.from_user.id):
         await state.clear()
         return await message.answer("🏠 Asosiy menyuga qaytdingiz.", reply_markup=main_menu)
     await state.clear()
