@@ -1,2 +1,2 @@
 # referal_botV2
-chopgan kot
+chopgan kot# bot_sum_reefral

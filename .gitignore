@@ -1,0 +1,11 @@
+.env
+.env.*
+*.pem
+__pycache__/
+*.pyc
+bot_data.db
+bot_data.db-shm
+bot_data.db-wal
+*.db
+*.db-shm
+*.db-wal

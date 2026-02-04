@@ -31,6 +31,10 @@ from database import (
     add_withdraw_notification, get_withdraw_notifications,
     backup_database,
     get_setting, set_setting, delete_setting,
+    list_offers, get_offer, create_withdraw_and_deduct,
+    create_purchase, update_purchase_status, list_pending_purchases,
+    create_offer, update_offer, delete_offer, get_user_rank,
+    adjust_balance, log_admin_action,
 )
 
 PROOF_CHANNEL_SETTING_KEY = "proof_channel_id"
@@ -159,12 +163,22 @@ class AdminManage(StatesGroup):
     REMOVE = State()
 
 
+class OfferManage(StatesGroup):
+    ADD = State()
+    REMOVE = State()
+
+
 class SearchUser(StatesGroup):
     WAIT = State()
 
 
 class WithdrawStates(StatesGroup):
+    CHOOSE_GAME = State()
     WAITING_FF_ID = State()
+
+
+class PurchaseStates(StatesGroup):
+    WAITING_PROOF = State()
 
 
 class WithdrawEdit(StatesGroup):
@@ -179,14 +193,68 @@ class GiveAlmaz(StatesGroup):
     WAIT = State()
 
 
+class AdjustAchko(StatesGroup):
+    ADD = State()
+    REMOVE = State()
+
+
 class ProofChannelSetup(StatesGroup):
     WAITING = State()
+
+
+class PaymentSetup(StatesGroup):
+    CARD = State()
+    HOLDER = State()
 
 
 def format_user_short(name: str, username: Optional[str]) -> str:
     if username:
         return f"@{username}"
     return name
+
+
+def format_game_label(game: str | None) -> str:
+    g = (game or "ff").lower()
+    if g == "pubg":
+        return "PUBG"
+    return "Free Fire"
+
+
+def parse_user_amount(text: str) -> tuple[int, int] | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if ":" in raw:
+        parts = [p.strip() for p in raw.split(":", 1)]
+    else:
+        parts = raw.split()
+    if len(parts) != 2:
+        return None
+    if not parts[0].isdigit():
+        return None
+    if not parts[1].lstrip("-").isdigit():
+        return None
+    return int(parts[0]), int(parts[1])
+
+
+DEFAULT_CARD_NUMBER = "5614 6816 2639 4070"
+DEFAULT_CARD_HOLDER = "Sh.Galya"
+
+
+async def get_payment_info() -> tuple[str, str]:
+    card_number = await get_setting("card_number") or DEFAULT_CARD_NUMBER
+    card_holder = await get_setting("card_holder") or DEFAULT_CARD_HOLDER
+    return card_number, card_holder
+
+
+def format_purchase_text(template: str, user_id: int, card_number: str, card_holder: str) -> str:
+    return (
+        (template or "")
+        .replace("{user_id}", str(user_id))
+        .replace("{user.id}", str(user_id))
+        .replace("{card_number}", card_number)
+        .replace("{card_holder}", card_holder)
+    )
 
 
 async def is_owner_or_admin(user_id: int) -> bool:
@@ -211,8 +279,9 @@ async def get_referral_reward() -> int:
 # =================== MENUS ===================
 main_menu = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="💎 Almaz Topish"), KeyboardButton(text="👤 Mening Profilim")],
-        [KeyboardButton(text="🏅 Top Foydalanuvchilar"), KeyboardButton(text="🛒 Almaz Do'koni")],
+        [KeyboardButton(text="💸 Pul ishlash"), KeyboardButton(text="👤 Mening Profilim")],
+        [KeyboardButton(text="🏆 Reyting"), KeyboardButton(text="💰 Pul Toldirish")],
+        [KeyboardButton(text="🕷️ Free Fire"), KeyboardButton(text="〽️ PUBG")],
         [KeyboardButton(text="📣 Yangiliklar & Bonuslar")],
     ], resize_keyboard=True
 )
@@ -220,14 +289,17 @@ main_menu = ReplyKeyboardMarkup(
 admin_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Foydalanuvchilar soni")],
-        [KeyboardButton(text="📰 Reklama/Yangilik sozlash"), KeyboardButton(text="💰 Almaz sotib olish matni")],
+        [KeyboardButton(text="📰 Reklama/Yangilik sozlash"), KeyboardButton(text="💰 achko sotib olish matni")],
+        [KeyboardButton(text="🟢 achko sotib olish matni")],
+        [KeyboardButton(text="💳 Karta raqami"), KeyboardButton(text="👤 Karta egasi")],
         [KeyboardButton(text="📢 Reklama yuborish"), KeyboardButton(text="🔎 Foydalanuvchini topish")],
         [KeyboardButton(text="🧩 Majburiy kanallar"), KeyboardButton(text="🛡 Admin boshqaruvi")],
-        [KeyboardButton(text="💎 Qo'lda almaz berish"), KeyboardButton(text="📈 Statistika")],
-        [KeyboardButton(text="⏳ Tanaffus berish"), KeyboardButton(text="🔧 Referal almaz qiymati")],
-        [KeyboardButton(text="📜 Isbotlar kanali")],
+        [KeyboardButton(text="➕ Pul berish"), KeyboardButton(text="➖ achko olib tashlash")],
+        [KeyboardButton(text="📈 Statistika"), KeyboardButton(text="⏳ Tanaffus berish")],
+        [KeyboardButton(text="🔧 Referal mukofoti (so'm)"), KeyboardButton(text="📜 Isbotlar kanali")],
         [KeyboardButton(text="💾 Backup yaratish")],
-        [KeyboardButton(text="⬅️ Chiqish")],
+        [KeyboardButton(text="🎯 Withdraw takliflar")],
+        [KeyboardButton(text="⬅️ Orqaga")],
     ], resize_keyboard=True
 )
 
@@ -309,28 +381,136 @@ async def guard_common(message: Message) -> bool:
     return False
 
 
+async def set_menu_state(state: FSMContext | None, current: str, prev: str | None):
+    if state is None:
+        return
+    await state.update_data(menu_current=current, menu_prev=prev)
+
+
+async def render_menu(menu_id: str | None, message: Message, state: FSMContext):
+    if menu_id == "admin":
+        if not await is_owner_or_admin(message.from_user.id):
+            return await message.answer("🚫 Siz admin emassiz.")
+        await set_menu_state(state, "admin", "main")
+        return await message.answer("👑 <b>Admin panel</b>", parse_mode="HTML", reply_markup=admin_menu)
+    if menu_id == "profile":
+        return await show_profile(message, state)
+    if menu_id == "referral":
+        return await earn_almaz(message, state)
+    if menu_id == "rating":
+        return await show_leaderboard_handler(message, state)
+    if menu_id == "shop":
+        return await buy_almaz(message, state)
+
+    await set_menu_state(state, "main", None)
+    return await message.answer("🏠 Asosiy menyu", reply_markup=main_menu)
+
+
+async def go_back_menu(message: Message, state: FSMContext):
+    data = await state.get_data()
+    prev = data.get("menu_prev") or "main"
+    return await render_menu(prev, message, state)
+
+
+async def open_withdraw_menu(message: Message, state: FSMContext, prev_menu: str):
+    user_id = message.from_user.id
+    user = await get_user(user_id)
+    if not user:
+        return await message.answer("Avval ro'yxatdan o'ting.")
+    balance = user[3] if len(user) > 3 and user[3] is not None else 0
+
+    await state.set_state(WithdrawStates.CHOOSE_GAME)
+    await state.update_data(withdraw_prev_menu=prev_menu)
+    await set_menu_state(state, "withdraw", prev_menu)
+
+    try:
+        ff_offers = await list_offers("ff")
+    except Exception:
+        ff_offers = []
+    try:
+        pubg_offers = await list_offers("pubg")
+    except Exception:
+        pubg_offers = []
+    if balance <= 0:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="wd_back_prev")]]
+        )
+        return await message.answer(
+            "⚠️ Hali yechib olish uchun balansingiz yetarli emas.",
+            reply_markup=kb
+        )
+    if not ff_offers and not pubg_offers:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="wd_back_prev")]]
+        )
+        return await message.answer(
+            "⚠️ Hozircha yechib olish takliflari yo'q.",
+            reply_markup=kb
+        )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔥 Free Fire", callback_data="wd_game:ff")],
+            [InlineKeyboardButton(text="🎯 PUBG", callback_data="wd_game:pubg")],
+            [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="wd_back_prev")],
+        ]
+    )
+
+    await message.answer(
+        "💳 <b>achkoni yechib olish</b>\n\n"
+        f"Balansingiz: <b>{balance} so'm</b>\n"
+        "Iltimos, o'yin bo'limini tanlang:",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+
+async def send_game_offers(message: Message, state: FSMContext, game: str, prev_menu: str):
+    await state.set_state(WithdrawStates.CHOOSE_GAME)
+    await state.update_data(withdraw_prev_menu=prev_menu)
+    await set_menu_state(state, "withdraw", prev_menu)
+    try:
+        offers = await list_offers(game)
+    except Exception:
+        offers = []
+
+    if not offers:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="wd_back_prev")]]
+        )
+        return await message.answer("Hozircha takliflar yo'q.", reply_markup=kb)
+
+    buttons = [[InlineKeyboardButton(text=f"{label} — {cost} som", callback_data=f"wd_offer:{oid}")] for oid, label, cost in offers]
+    buttons.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="wd_back_prev")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await message.answer("Iltimos, yechib olmoqchi bo'lgan taklifni tanlang:", reply_markup=kb)
+
+
 async def update_withdraw_admin_messages(request_id: int, status_label: str):
     notifications = await get_withdraw_notifications(request_id)
     req = await get_withdraw_request(request_id)
     if not req:
         return
-    r_id, user_id, amount, ff_id, status, created_at, processed_at, processed_by, note = req
+    r_id, user_id, amount, ff_id, game, status, created_at, processed_at, processed_by, note = req
     user = await get_user(user_id)
     username = user[1] if user else None
     almaz = user[3] if user and len(user) > 3 and user[3] is not None else 0
     refs = await count_verified_referrals(user_id)
+    game_label = format_game_label(game)
+    id_label = "Free Fire ID" if (game or "ff") == "ff" else "PUBG ID"
 
     created_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(created_at or int(time.time())))
     processed_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(processed_at)) if processed_at else "—"
     note_part = f"\n📝 Izoh: {note}" if note else ""
 
     base_text = (
-        "🧾 <b>Almaz yechish so'rovi</b>\n\n"
+        "🧾 <b>Pul yechish so'rovi</b>\n\n"
         f"👤 Foydalanuvchi: @{username or 'Anonim'} (ID: <code>{user_id}</code>)\n"
-        f"💎 Joriy balans: <b>{almaz} Almaz</b>\n"
-        f"🔥 Yechmoqchi bo'lgan miqdor: <b>{amount} Almaz</b>\n"
+        f"💎 Joriy balans: <b>{almaz} som</b>\n"
+        f"🔥 Yechmoqchi bo'lgan miqdor: <b>{amount} som</b>\n"
         f"👥 Umumiy tasdiqlangan takliflar: <b>{refs}</b>\n"
-        f"🎮 Free Fire ID: <code>{ff_id}</code>\n"
+        f"🎮 O'yin: <b>{game_label}</b>\n"
+        f"🎮 {id_label}: <code>{ff_id}</code>\n"
         f"🕒 So'rov vaqti: {created_str}\n"
         f"🕒 Qayta ishlangan: {processed_str}"
         f"{note_part}\n\n"
@@ -350,7 +530,7 @@ async def update_withdraw_admin_messages(request_id: int, status_label: str):
             log.warning("withdraw msg edit failed: %s", e)
 
 
-async def send_proof_receipt(request_id: int, user_id: int, amount: int, ff_id: Optional[str]):
+async def send_proof_receipt(request_id: int, user_id: int, amount: int, ff_id: Optional[str], game: str | None):
     channel_value = await get_proof_channel_value()
     chat_id = resolve_proof_chat_id(channel_value)
     if not chat_id:
@@ -362,12 +542,15 @@ async def send_proof_receipt(request_id: int, user_id: int, amount: int, ff_id: 
     verified_refs = await count_verified_referrals(user_id)
     ff_value = ff_id or "Ko'rsatilmagan"
     now = time.strftime("%d.%m.%Y %H:%M:%S", time.localtime())
+    game_label = format_game_label(game)
+    id_label = "Free Fire ID" if (game or "ff") == "ff" else "PUBG ID"
 
     text = (
-        "✅ <b>Almaz yechish tasdiqlandi</b>\n\n"
+        "✅ <b>Pul yechish tasdiqlandi</b>\n\n"
         f"👤 Foydalanuvchi: {mention} (ID: <code>{user_id}</code>)\n"
-        f"🎮 Free Fire ID: <code>{ff_value}</code>\n"
-        f"💎 Miqdor: <b>{amount} Almaz</b>\n"
+        f"🎮 O'yin: <b>{game_label}</b>\n"
+        f"🎮 {id_label}: <code>{ff_value}</code>\n"
+        f"💎 Miqdor: <b>{amount} so'm</b>\n"
         f"👥 Umumiy tasdiqlangan takliflari: <b>{verified_refs}</b>\n"
         f"🆔 So'rov ID: <code>{request_id}</code>\n"
         f"🕒 Tasdiqlangan vaqt: {now}"
@@ -384,24 +567,61 @@ async def send_proof_receipt(request_id: int, user_id: int, amount: int, ff_id: 
         log.warning("Isbotlar kanaliga yuborib bo'lmadi (%s): %s", channel_value, exc)
 
 
+async def send_withdraw_request_to_proof_channel(request_id: int):
+    channel_value = await get_proof_channel_value()
+    chat_id = resolve_proof_chat_id(channel_value)
+    if not chat_id:
+        return
+
+    req = await get_withdraw_request(request_id)
+    if not req:
+        return
+
+    _, user_id, amount, ff_id, game, status, created_at, _, _, _ = req
+    user = await get_user(user_id)
+    username = user[1] if user else None
+    mention = f"@{username}" if username else f"ID: {user_id}"
+    game_label = format_game_label(game)
+    id_label = "Free Fire ID" if (game or "ff") == "ff" else "PUBG ID"
+    created_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(created_at or int(time.time())))
+
+    text = (
+        "🧾 <b>Yangi yechib olish so'rovi</b>\n\n"
+        f"👤 Foydalanuvchi: {mention} (ID: <code>{user_id}</code>)\n"
+        f"🎮 O'yin: <b>{game_label}</b>\n"
+        f"🎮 {id_label}: <code>{ff_id}</code>\n"
+        f"💎 Miqdor: <b>{amount} so'm</b>\n"
+        f"🕒 So'rov vaqti: {created_str}\n"
+        "⏳ Holat: <b>Kutilmoqda</b>"
+    )
+
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as exc:
+        log.warning("Isbotlar kanaliga yuborib bo'lmadi (%s): %s", channel_value, exc)
+
+
 async def notify_admins_about_withdraw(request_id: int):
     req = await get_withdraw_request(request_id)
     if not req:
         return
-    r_id, user_id, amount, ff_id, status, created_at, processed_at, processed_by, note = req
+    r_id, user_id, amount, ff_id, game, status, created_at, processed_at, processed_by, note = req
     user = await get_user(user_id)
     username = user[1] if user else None
     almaz = user[3] if user and len(user) > 3 and user[3] is not None else 0
     refs = await count_verified_referrals(user_id)
     created_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(created_at or int(time.time())))
+    game_label = format_game_label(game)
+    id_label = "Free Fire ID" if (game or "ff") == "ff" else "PUBG ID"
 
     text = (
-        "🧾 <b>Yangi almaz yechish so'rovi</b>\n\n"
+        "🧾 <b>Yangi Pul yechish so'rovi</b>\n\n"
         f"👤 Foydalanuvchi: @{username or 'Anonim'} (ID: <code>{user_id}</code>)\n"
-        f"💎 Joriy balans: <b>{almaz} Almaz</b>\n"
-        f"🔥 Yechmoqchi: <b>{amount} Almaz</b>\n"
+        f"💎 Joriy balans: <b>{almaz} so'm</b>\n"
+        f"🔥 Yechmoqchi: <b>{amount} so'm</b>\n"
         f"👥 Umumiy tasdiqlangan takliflar: <b>{refs}</b>\n"
-        f"🎮 Free Fire ID: <code>{ff_id}</code>\n"
+        f"🎮 O'yin: <b>{game_label}</b>\n"
+        f"🎮 {id_label}: <code>{ff_id}</code>\n"
         f"🕒 So'rov vaqti: {created_str}\n\n"
         "Quyidagi tugmalar orqali so'rovni boshqaring 👇"
     )
@@ -488,7 +708,6 @@ async def cmd_start(message: Message, state: FSMContext):
             if actual_ref and actual_ref == ref_id:
                 try:
                     created = await create_referral(ref_id, user_id)
-                    # only notify inviter when a new referral record was actually created
                     if created:
                         try:
                             invited_label = format_user_short(
@@ -504,7 +723,7 @@ async def cmd_start(message: Message, state: FSMContext):
                                 "⏳ Endi faqat <b>2 ta qadam</b> qoldi:\n"
                                 "• Kanalga a’zo bo‘lish\n"
                                 "• Telefon raqamni tasdiqlash\n\n"
-                                f"💎 Ushbu jarayon yakunlangach, siz <b>{reward} Almaz</b>ga ega bo‘lasiz.\n"
+                                f"💎 Ushbu jarayon yakunlangach, siz <b>{reward} so'm</b>ga ega bo‘lasiz.\n"
                                 "⚡ Do‘stlaringiz harakati — sizning foydangiz!",
                                 parse_mode="HTML"
                             )
@@ -552,14 +771,16 @@ async def cmd_start(message: Message, state: FSMContext):
         return
 
     await state.clear()
+    await set_menu_state(state, "admin", "main")
     
+    await set_menu_state(state, "main", None)
     await bot.send_message(
     chat_id=message.chat.id,
     text=(
          f"🎉 <b>Tabriklaymiz, {message.from_user.first_name}!</b>\n\n"
         "✅ Siz barcha tekshiruvlardan muvaffaqiyatli o‘tdingiz.\n"
         "🚀 Endi botning barcha imkoniyatlari siz uchun ochiq!\n\n"
-        "💎 Almaz toping, profilingizni rivojlantiring va mukofotlarni qo‘lga kiriting.\n\n"
+        "💎 Pul to‘plang, profilingizni rivojlantiring va mukofotlarni qo‘lga kiriting.\n\n"
         "👇 Quyidagi menyudan boshlang:"
     ),
     reply_markup=main_menu,
@@ -582,9 +803,7 @@ async def phone_contact_ok(message: Message, state: FSMContext):
 
     phone = (contact.phone_number or "").strip()
     phone = phone if phone.startswith("+") else "+" + phone
-    if not phone.startswith("+998"):
-        await message.answer("❌ Faqat O'zbekiston raqamlari qabul qilinadi (+998...).")
-        return
+    
 
     await set_phone_verified(user_id, phone)
     await set_verified(user_id)
@@ -595,12 +814,12 @@ async def phone_contact_ok(message: Message, state: FSMContext):
         # mark_referral_verified returns True only when we actually transitioned to verified
         did_verify = await mark_referral_verified(user_id)
         if did_verify:
-            # Step 2: Add Almaz reward (with error handling)
+            # Step 2: Add achko reward (with error handling)
             try:
                 reward = await get_referral_reward()
                 await add_almaz(ref_by, reward)
             except Exception as e:
-                log.warning("Almaz qo'shishda xatolik: %s", e)
+                log.warning("So'm qo'shishda xatolik: %s", e)
 
             # Step 3: Update rank (with error handling)
             try:
@@ -619,7 +838,7 @@ async def phone_contact_ok(message: Message, state: FSMContext):
                 txt = (
                     "🎊 <b>Mukofot tayyor! Zo‘r ishladingiz</b>\n\n"
                     f"✅ Siz taklif qilgan <b>{invited_label}</b> barcha tekshiruvlardan muvaffaqiyatli o‘tdi.\n\n"
-                    f"💎 Hisobingizga <b>{reward} Almaz</b> muvaffaqiyatli qo‘shildi!\n"
+                    f"💎 Hisobingizga <b>{reward} so'm</b> muvaffaqiyatli qo‘shildi!\n"
                     f"👥 Tasdiqlangan takliflaringiz soni: <b>{total}</b>\n\n"
                     "🔥 Qanchalik ko‘p do‘st taklif qilsangiz — shunchalik tez kuchli mukofotlarga yetasiz.\n"
                     "🚀 Davom eting, imkoniyat siz tomonda!"
@@ -630,7 +849,7 @@ async def phone_contact_ok(message: Message, state: FSMContext):
                 log.info(f"✅ 2-xabar muvaffaqiyatli yuborildi: {ref_by}")
 
             except Exception as e:
-                # Even if message fails, Almaz is already added
+                # Even if message fails, achko is already added
                 log.error(f"❌ 2-xabar yuborishda xatolik (ref_by={ref_by}): {e}")
 
     await state.clear()
@@ -662,18 +881,17 @@ async def phone_contact_waiting(message: Message, state: FSMContext):
 async def user_help(message: Message):
     await message.answer(
         "🆘 <b>Yordam</b>\n\n"
-        "💎 Almaz Topish — Do'st chaqirish orqali Almaz\n"
+        "Almaz yoki UC — Do'st chaqirish orqali Pul\n"
         "👤 Mening Profilim — Profil va balans ma'lumotlari\n"
-        "🏅 Top Foydalanuvchilar — Top 15 foydalanuvchi (Almaz bo'yicha)\n"
-        "🛒 Almaz Do'koni — To'lov variantlari\n"
+        "🏆 Reyting — Top 15 foydalanuvchi (pul bo‘yicha)\n"
         "📣 Yangiliklar & Bonuslar — E'lonlar",
         parse_mode="HTML"
     )
 
 
-# ============== Profil / Reyting / Almaz / News / Buy ==============
+# ============== Profil / Reyting / achko / News / Buy ==============
 @dp.message(F.text == "👤 Mening Profilim")
-async def show_profile(message: Message):
+async def show_profile(message: Message, state: FSMContext):
     if await guard_common(message):
         return
     user = await get_user(message.from_user.id)
@@ -685,39 +903,53 @@ async def show_profile(message: Message):
     total_refs = await count_verified_referrals(message.from_user.id)
     username = user[1] or (message.from_user.username or "Anonim")
 
+    rank, total_users = await get_user_rank(message.from_user.id)
+
     text = (
-        "👤 <b>Sizning profilingiz</b>\n\n"
-        f"🆔 <b>Username:</b> @{username}\n"
-        f"💎 <b>Balans:</b> {almaz} Almaz\n"
-        f"🤝 <b>Faol takliflar:</b> {total_refs}\n\n"
-        "📈 Bu yerda barcha yutuqlaringiz jamlangan.\n"
-        "👇 Almazlaringizni hoziroq foydaga aylantiring!"
+        "👤 <b>Profilingiz</b>\n\n"
+        f"🆔 Sizning ID: <code>{message.from_user.id}</code>\n"
+        f"👤 Username: @{username or 'Anonim'}\n"
+        f"📊 Reyting o‘rni: {rank}/{total_users}\n"
+        f"💎 Ballar soni: {almaz} so'm\n"
+        f"🤝 Umumiy tasdiqlangan takliflar: {total_refs}\n\n"
+        "➖ Almaz yoki UC ni istalgan vaqtda yechib olishingiz mumkin"
     )
 
+    await set_menu_state(state, "profile", "main")
+    await message.answer(text, parse_mode="HTML", reply_markup=back_kb)
 
 
-    withdraw_kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Almazni yechish", callback_data="withdraw_start")]
-        ]
-    )
-
-    await message.answer(text, parse_mode="HTML", reply_markup=withdraw_kb)
-
-
-@dp.message(F.text == "🏅 Top Foydalanuvchilar")
-async def show_leaderboard_handler(message: Message):
+@dp.message(F.text.in_(["🏆 Reyting", "🏅 Top Foydalanuvchilar"]))
+async def show_leaderboard_handler(message: Message, state: FSMContext):
     if await guard_common(message):
         return
     leaders = await get_leaderboard(limit=15)
     if not leaders:
         return await message.answer("📉 Hozircha reyting bo'sh.")
-    text = "🏅 <b>Top 15 foydalanuvchi (Almaz bo'yicha)</b>\n\n"
+    text = "🏆 <b>Top 15 foydalanuvchi (uzs bo‘yicha)</b>\n\n"
     for i, (username, almaz) in enumerate(leaders[:15], 1):
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "⭐"
         text += f"{medal} @{(username or 'Anonim')} — 💎 {almaz}\n"
-    proof_kb = await build_proof_keyboard()
-    await message.answer(text, parse_mode="HTML", reply_markup=proof_kb)
+    await set_menu_state(state, "rating", "main")
+    await message.answer(text, parse_mode="HTML", reply_markup=back_kb)
+
+
+@dp.message(F.text == "🕷️ Free Fire")
+async def free_fire_menu(message: Message, state: FSMContext):
+    if await guard_common(message):
+        return
+    data = await state.get_data()
+    prev_menu = data.get("menu_current") or "main"
+    await send_game_offers(message, state, "ff", prev_menu)
+
+
+@dp.message(F.text == "〽️ PUBG")
+async def pubg_menu(message: Message, state: FSMContext):
+    if await guard_common(message):
+        return
+    data = await state.get_data()
+    prev_menu = data.get("menu_current") or "main"
+    await send_game_offers(message, state, "pubg", prev_menu)
 
 
 @dp.callback_query(F.data == PROOF_CHANNEL_BUTTON)
@@ -736,8 +968,8 @@ async def proof_channel_button_handler(cb: CallbackQuery):
     await cb.answer("ℹ️ Kanal maxfiy formatda saqlangan. Havola mavjud emas.", show_alert=True)
 
 
-@dp.message(F.text == "💎 Almaz Topish")
-async def earn_almaz(message: Message):
+@dp.message(F.text.in_(["💸 Pul ishlash", "💎 Almaz Topish"]))
+async def earn_almaz(message: Message, state: FSMContext):
     if await guard_common(message):
         return
 
@@ -747,12 +979,12 @@ async def earn_almaz(message: Message):
     reward = await get_referral_reward()
 
     html_text = (
-        "🎯 <b>Almaz Topish — tez, bepul va samarali</b>\n\n"
-        "💎 Bu bo‘limda siz hech qanday sarmoyasiz almaz yig‘asiz.\n"
+        "🎯 <b>Pul Topish — tez, bepul va samarali</b>\n\n"
+        "💎 Bu bo‘limda siz hech qanday sarmoyasiz pul yig‘asiz.\n"
         "Faqat do‘stlaringizni taklif qiling — qolganini tizim bajaradi.\n\n"
 
         "⚙️ <b>Jarayon juda oddiy:</b>\n"
-        f"Do‘st → Bot → Tasdiq → Sizga <b>{reward} Almaz</b> 💎\n\n"
+        f"Do‘st → Bot → Tasdiq → Sizga <b>{reward} so'm</b> 💎\n\n"
 
         "🔗 <b>Sizning shaxsiy taklif havolangiz:</b>\n"
         f"https://t.me/{bot_username}?start=ref_{user_id}\n\n"
@@ -762,30 +994,19 @@ async def earn_almaz(message: Message):
 
     )
 
-    plain_text = (
-        f"💎 Almaz Topish — eng tez yo'l!\n\n"
-        f"Free Fire'da kuchli bo'lishni xohlaysizmi? 🔥\n"
-        f"Qimmat skinlar, elita pass va itemlarga bepul ega bo'lish imkoniyatini qo'ldan boy bermang! 💎\n\n"
-        f"Do'stingizni taklif qiling va darhol {reward} Almaz oling!\n"
-        f"Taklif havolangiz: https://t.me/{bot_username}?start={user_id}"
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="💳 Pulni yechib olish")],
+            [KeyboardButton(text="⬅️ Orqaga")]
+        ],
+        resize_keyboard=True
     )
-
-    share_kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📤 Do'stlarga ulashish",
-                    switch_inline_query=plain_text
-                )
-            ]
-        ]
-    )
-
-    await message.answer(html_text, parse_mode="HTML", reply_markup=share_kb)
+    await set_menu_state(state, "referral", "main")
+    await message.answer(html_text, parse_mode="HTML", reply_markup=kb)
 
 
 @dp.message(F.text == "📣 Yangiliklar & Bonuslar")
-async def show_news(message: Message):
+async def show_news(message: Message, state: FSMContext):
     if await guard_common(message):
         return
     content = await get_dynamic_text("news")
@@ -794,64 +1015,180 @@ async def show_news(message: Message):
     if content.startswith("MSG:"):
         try:
             _, chat_id_str, msg_id_str = content.split(":")
-            await bot.copy_message(message.chat.id, int(chat_id_str), int(msg_id_str))
+            await set_menu_state(state, "news", "main")
+            await bot.copy_message(
+                message.chat.id,
+                int(chat_id_str),
+                int(msg_id_str),
+                reply_markup=back_kb
+            )
             return
         except Exception as e:
             log.warning("copy news failed: %s", e)
-    await message.answer(f"📰 <b>So'nggi yangiliklar</b>\n\n{content}", parse_mode="HTML")
+    await set_menu_state(state, "news", "main")
+    await message.answer(f"📰 <b>So'nggi yangiliklar</b>\n\n{content}", parse_mode="HTML", reply_markup=back_kb)
 
 
-@dp.message(F.text == "🛒 Almaz Do'koni")
-async def buy_almaz(message: Message):
+@dp.message(F.text.in_(["🛒 achko do'koni", "🛒 Almaz Do'koni"]))
+async def buy_almaz(message: Message, state: FSMContext):
     if await guard_common(message):
         return
     text = await get_dynamic_text("almaz_buy")
     if not text:
         text = (
-            "🛒 <b>Almaz Do'koni</b>\n\n"
-            "1️⃣ 10 000 so'm → 100 Almaz\n"
-            "2️⃣ 25 000 so'm → 300 Almaz\n"
-            "3️⃣ 40 000 so'm → 500 Almaz\n\n"
-            "To'lovdan so'ng shuni yozing: <code>10000 123456789</code>"
+            "🛒 <b>do'kon</b>\n\n"
+            "To'lov qilganingizdan so'ng, <b>Pul Toldirish</b> bo'limiga o'ting."
         )
-    await message.answer(text, parse_mode="HTML")
+    await set_menu_state(state, "shop", "main")
+    await message.answer(text, parse_mode="HTML", reply_markup=back_kb)
 
 
-# ============== Almaz YECHISH ==============
-@dp.callback_query(F.data == "withdraw_start")
-async def withdraw_start(cb: CallbackQuery, state: FSMContext):
-    user_id = cb.from_user.id
-    user = await get_user(user_id)
-    if not user:
-        await cb.answer("Avval ro'yxatdan o'ting.", show_alert=True)
+@dp.message(F.text.in_(["💰 Pul Toldirish", "➕ achko sotib olish", "➕ Achko sotib olish"]))
+async def purchase_prompt(message: Message, state: FSMContext):
+    if await guard_common(message):
         return
-    balance = user[3] if len(user) > 3 and user[3] is not None else 0
-    if balance < 105:
-        await cb.message.answer(
-            "⚠️ Hali almaz yechish uchun balansingiz yetarli emas.\n\n"
-            "Eng kamida <b>105 Almaz</b> to'plasangiz, ishlagan almazlaringizni Free Fire akkauntingizga yechib olishingiz mumkin.",
-            parse_mode="HTML"
+    await state.set_state(PurchaseStates.WAITING_PROOF)
+    template = await get_dynamic_text("achko_purchase")
+    card_number, card_holder = await get_payment_info()
+    if not template:
+        template = (
+            "🟢 Achko sotib olish\n\n"
+            "📌 To‘lov qilish uchun karta:\n"
+            "{card_number}\n"
+            "👤 {card_holder}\n\n"
+            "🆔 Sizning ID: {user_id}\n"
+            "(Iltimos, to‘lov qilayotganda ID ni o‘zgartirmang)\n\n"
+            "📤 To‘lovdan keyin\n\n"
+            "To‘lovni amalga oshirgach, chekni rasm yoki fayl shaklida yuboring:\n\n"
+            "📸 Screenshot (skrinshot)\n\n"
+            "📄 PDF yoki boshqa fayl\n\n"
+            "⚠️ Muhim:\n\n"
+            "Summani matn ko‘rinishida yozish shart emas\n\n"
+            "Admin chekni ko‘rib, qancha achko qo‘shish kerakligini o‘zi aniqlaydi\n\n"
+            "❗ Agar chek yubora olmasangiz yoki muammo bo‘lsa,\n"
+            "👉 @username_support ga murojaat qiling"
         )
-        await cb.answer()
-        return
-
-    buttons = []
-    if balance >= 105:
-        buttons.append(InlineKeyboardButton(text="105 Almaz 💎", callback_data="wd_amount:105"))
-    if balance >= 210:
-        buttons.append(InlineKeyboardButton(text="210 Almaz 💎", callback_data="wd_amount:210"))
-    if balance >= 326:
-        buttons.append(InlineKeyboardButton(text="326 Almaz 💎", callback_data="wd_amount:326"))
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[buttons])
-
-    await cb.message.answer(
-        "💳 <b>Almaz yechish</b>\n\n"
-        f"Balansingiz: <b>{balance} Almaz</b>\n"
-        "Qancha almazni yechmoqchi ekanligingizni tanlang:",
-        parse_mode="HTML",
-        reply_markup=kb
+    await message.answer(
+        format_purchase_text(template, message.from_user.id, card_number, card_holder),
+        reply_markup=back_kb
     )
+    copy_kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="📋 Kartani nusxalash", callback_data="copy_card")]]
+    )
+    await message.answer("Karta raqamini nusxalash:", reply_markup=copy_kb)
+
+
+@dp.message(StateFilter(PurchaseStates.WAITING_PROOF), F.content_type.in_({ContentType.PHOTO, ContentType.DOCUMENT}))
+async def purchase_receive_proof(message: Message, state: FSMContext):
+    if (message.text or "").strip() == "⬅️ Orqaga":
+        await state.clear()
+        return await message.answer("⏎ Sotib olish bekor qilindi.", reply_markup=main_menu)
+
+    user_id = message.from_user.id
+    amount = 0
+
+    # forward/copy message to proof channel if configured
+    channel_value = await get_proof_channel_value()
+    proof_chat = resolve_proof_chat_id(channel_value)
+    proof_msg_id = None
+    proof_chat_id = None
+    try:
+        if proof_chat:
+            sent = None
+            try:
+                if message.photo:
+                    sent = await bot.copy_message(chat_id=proof_chat, from_chat_id=message.chat.id, message_id=message.message_id)
+                else:
+                    sent = await bot.copy_message(chat_id=proof_chat, from_chat_id=message.chat.id, message_id=message.message_id)
+            except Exception:
+                sent = None
+            if sent:
+                proof_msg_id = sent.message_id
+                proof_chat_id = proof_chat
+    except Exception:
+        proof_msg_id = None
+        proof_chat_id = None
+
+    # create purchase record for admins to process
+    try:
+        purchase_id = await create_purchase(user_id, amount, proof_chat_id or 0, proof_msg_id or 0)
+    except Exception:
+        purchase_id = None
+
+    await state.clear()
+    await set_menu_state(state, "admin", "main")
+    await message.answer(
+        "✅ Chek qabul qilindi. Tez orada adminlar tekshiradi va pul hisobingizga qo'shiladi.",
+        reply_markup=main_menu
+    )
+    # notify admins
+    admins = [OWNER_ID, OWNER2_ID]
+    extra = await list_admins()
+    for uid, _ in extra:
+        if uid not in admins:
+            admins.append(uid)
+    for aid in admins:
+        try:
+            await bot.copy_message(chat_id=aid, from_chat_id=message.chat.id, message_id=message.message_id)
+            await bot.send_message(
+                aid,
+                f"🧾 Yangi sotib olish talabi: ID {user_id} — summa: ko'rsatilmagan — purchase_id: {purchase_id}"
+            )
+        except Exception:
+            pass
+
+
+@dp.callback_query(F.data == "copy_card")
+async def copy_card_callback(cb: CallbackQuery):
+    card_number, _ = await get_payment_info()
+    await cb.message.answer(f"💳 Karta raqami:\n<code>{card_number}</code>", parse_mode="HTML")
+    await cb.answer("Karta raqami yuborildi.")
+
+
+@dp.message(StateFilter(PurchaseStates.WAITING_PROOF))
+async def purchase_invalid_proof(message: Message, state: FSMContext):
+    if (message.text or "").strip() == "⬅️ Orqaga":
+        await state.clear()
+        return await message.answer("⏎ Sotib olish bekor qilindi.", reply_markup=main_menu)
+    await message.answer(
+        "Iltimos, chekni rasm yoki fayl shaklida yuboring.\n"
+        "📸 Screenshot yoki 📄 PDF.",
+        reply_markup=back_kb
+    )
+
+
+# ============== achko YECHIB OLISH ==============
+@dp.message(F.text.in_(["💳 Pulni yechib olish", "💳 Almazni yechish"]))
+async def withdraw_start_message(message: Message, state: FSMContext):
+    if await guard_common(message):
+        return
+    data = await state.get_data()
+    prev_menu = data.get("menu_current") or "main"
+    await open_withdraw_menu(message, state, prev_menu)
+
+
+@dp.callback_query(F.data == "withdraw_start")
+async def withdraw_start_cb(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    prev_menu = data.get("menu_current") or "main"
+    await open_withdraw_menu(cb.message, state, prev_menu)
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "wd_back_prev")
+async def withdraw_back_prev(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    prev_menu = data.get("withdraw_prev_menu") or "main"
+    await state.clear()
+    await render_menu(prev_menu, cb.message, state)
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "wd_back_menu")
+async def withdraw_back_menu(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    prev_menu = data.get("withdraw_prev_menu") or "main"
+    await open_withdraw_menu(cb.message, state, prev_menu)
     await cb.answer()
 
 
@@ -874,11 +1211,65 @@ async def withdraw_choose_amount(cb: CallbackQuery, state: FSMContext):
         return
 
     await state.set_state(WithdrawStates.WAITING_FF_ID)
-    await state.update_data(withdraw_amount=amount)
+    await state.update_data(withdraw_amount=amount, game="ff")
 
     await cb.message.answer(
-        "🎮 Endi, almaz yechmoqchi bo'lgan Free Fire akkauntingiz <b>ID raqamini</b> yuboring.\n\n"
-        "ID ni diqqat bilan tekshirib yuboring — almaz aynan shu akkauntga tushiriladi.",
+        "🎮 Endi, yechib olmoqchi bo'lgan akkauntingiz <b>ID raqamini</b> yuboring.\n\n"
+        "ID ni diqqat bilan tekshirib yuboring — pul aynan shu akkauntga tushiriladi.",
+        parse_mode="HTML"
+    )
+    await cb.answer()
+
+
+
+@dp.callback_query(F.data.startswith("wd_game:"))
+async def withdraw_game_selected(cb: CallbackQuery, state: FSMContext):
+    game = cb.data.split(":", 1)[1]
+    # load offers for this game
+    try:
+        offers = await list_offers(game)
+    except Exception:
+        offers = []
+
+    buttons = []
+    if offers:
+        for oid, label, cost in offers:
+            buttons.append([InlineKeyboardButton(text=f"{label} — {cost} so'm", callback_data=f"wd_offer:{oid}")])
+
+    if not buttons:
+        await cb.answer("Hozircha takliflar yo'q yoki balans yetarli emas.", show_alert=True)
+        return
+
+    buttons.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="wd_back_menu")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await cb.message.answer("Iltimos, yechib olmoqchi bo'lgan taklifni tanlang:", reply_markup=kb)
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("wd_offer:"))
+async def withdraw_offer_selected(cb: CallbackQuery, state: FSMContext):
+    try:
+        offer_id = int(cb.data.split(":", 1)[1])
+    except Exception:
+        return await cb.answer("Noto'g'ri taklif.", show_alert=True)
+
+    offer = await get_offer(offer_id)
+    if not offer:
+        return await cb.answer("Taklif topilmadi.", show_alert=True)
+
+    _, game, label, achko_cost = offer
+    user = await get_user(cb.from_user.id)
+    balance = user[3] if len(user) > 3 and user[3] is not None else 0
+    if balance < achko_cost:
+        return await cb.answer("Balansingiz yetarli emas.", show_alert=True)
+
+    # store offer and wait for account id
+    await state.set_state(WithdrawStates.WAITING_FF_ID)
+    await state.update_data(offer_id=offer_id, withdraw_amount=achko_cost, game=game)
+
+    await cb.message.answer(
+        f"Siz tanladingiz: {label} — {achko_cost} som.\n"
+        "Endi, yechib olmoqchi bo'lgan akkauntingiz ID raqamini yuboring (Free Fire yoki UC):",
         parse_mode="HTML"
     )
     await cb.answer()
@@ -889,29 +1280,42 @@ async def withdraw_receive_ff_id(message: Message, state: FSMContext):
     user_id = message.from_user.id
     data = await state.get_data()
     amount = data.get("withdraw_amount")
+    game = data.get("game") or "ff"
     ff_id = (message.text or "").strip()
+
+    if ff_id == "⬅️ Orqaga":
+        prev_menu = data.get("withdraw_prev_menu") or "main"
+        await state.clear()
+        return await open_withdraw_menu(message, state, prev_menu)
 
     if not amount or not ff_id:
         await message.answer("❌ Noto'g'ri ma'lumot. /start yuborib qayta urinib ko'ring.")
         await state.clear()
         return
 
-    if len(ff_id) < 3:
-        await message.answer("⚠️ Free Fire ID juda qisqa ko'rinmoqda. Iltimos, qayta tekshirib yuboring.")
+    if len(ff_id) < 1:
+        await message.answer("⚠️ ID juda qisqa ko'rinmoqda. Iltimos, qayta tekshirib yuboring.")
         return
 
-    request_id = await create_withdraw_request(user_id, int(amount), ff_id)
+    # create withdraw request and deduct atomically
+    req_id = await create_withdraw_and_deduct(user_id, int(amount), ff_id, game=game)
+    if not req_id:
+        await message.answer("❌ Balansingiz yetarli emas yoki xatolik yuz berdi.")
+        await state.clear()
+        return
+
     await state.clear()
 
     await message.answer(
-        "✅ Almaz yechish bo'yicha so'rovingiz qabul qilindi!\n\n"
-        f"🔥 Miqdor: <b>{amount} Almaz</b>\n"
-        f"🎮 Free Fire ID: <code>{ff_id}</code>\n\n"
-        "Almaz 24 soat ichida Free Fire akkauntingizga tushiriladi. Iltimos, sabr qiling 🙂",
+        "✅ pul yechish bo'yicha so'rovingiz qabul qilindi!\n\n"
+        f"🔥 Miqdor: <b>{amount} som</b>\n"
+        f"🎮 Akkaunt ID: <code>{ff_id}</code>\n\n"
+        "So'rov adminlarga yuborildi. Iltimos, sabr qiling 🙂",
         parse_mode="HTML"
     )
 
-    await notify_admins_about_withdraw(request_id)
+    await notify_admins_about_withdraw(req_id)
+    await send_withdraw_request_to_proof_channel(req_id)
 
 
 # ============== Withdraw admin callbacklari ==============
@@ -931,33 +1335,31 @@ async def withdraw_approve(cb: CallbackQuery):
         await cb.answer("So'rov topilmadi yoki o'chirib yuborilgan.", show_alert=True)
         return
 
-    r_id, user_id, amount, ff_id, status, created_at, processed_at, processed_by, note = req
+    r_id, user_id, amount, ff_id, game, status, created_at, processed_at, processed_by, note = req
     if status != "pending":
         await cb.answer(f"Bu so'rov allaqachon '{status}' holatida.", show_alert=True)
         return
 
     user = await get_user(user_id)
     balance = user[3] if user and len(user) > 3 and user[3] is not None else 0
-    if balance < amount:
-        await cb.answer("Foydalanuvchi balansida bu miqdor yetarli emas.", show_alert=True)
-        return
-
-    await add_almaz(user_id, -amount)
+    # If balance still has amount, deduct now (old-style requests).
+    if balance >= amount:
+        await add_almaz(user_id, -amount)
     await update_withdraw_status(req_id, "approved", cb.from_user.id, None)
     await update_withdraw_admin_messages(req_id, "✅ Tasdiqlandi")
 
     try:
         await bot.send_message(
             user_id,
-            "🎉 Almaz yechish so'rovingiz tasdiqlandi!\n\n"
-            f"💎 Miqdor: <b>{amount} Almaz</b>\n"
-            "Almazingiz Free Fire akkauntingizga muvaffaqiyatli tashlab berildi. Rahmat! 😊",
+            "🎉 Pul yechish so'rovingiz tasdiqlandi!\n\n"
+            f"💎 Miqdor: <b>{amount} so'm</b>\n"
+            "Mukofotingiz hisobingizga muvaffaqiyatli tashlab berildi. Rahmat! 😊",
             parse_mode="HTML"
         )
     except Exception:
         pass
 
-    await send_proof_receipt(req_id, user_id, amount, ff_id)
+    await send_proof_receipt(req_id, user_id, amount, ff_id, game)
     await cb.answer("So'rov tasdiqlandi.")
 
 
@@ -977,7 +1379,7 @@ async def withdraw_reject(cb: CallbackQuery):
         await cb.answer("So'rov topilmadi yoki o'chirib yuborilgan.", show_alert=True)
         return
 
-    r_id, user_id, amount, ff_id, status, created_at, processed_at, processed_by, note = req
+    r_id, user_id, amount, ff_id, game, status, created_at, processed_at, processed_by, note = req
     if status != "pending":
         await cb.answer(f"Bu so'rov allaqachon '{status}' holatida.", show_alert=True)
         return
@@ -988,7 +1390,7 @@ async def withdraw_reject(cb: CallbackQuery):
     try:
         await bot.send_message(
             user_id,
-            "❌ Almaz yechish bo'yicha so'rovingiz rad etildi.\n\n"
+            "❌ Pul yechish bo'yicha so'rovingiz rad etildi.\n\n"
             "Bunga turli sabablar bo'lishi mumkin (qoidabuzarlik, noto'g'ri ma'lumot va hokazo).\n"
             "Agar bu xatolik deb o'ylasangiz, qo'llab-quvvatlashga murojaat qilishingiz mumkin.",
             parse_mode="HTML"
@@ -1014,8 +1416,8 @@ async def withdraw_edit_start(cb: CallbackQuery, state: FSMContext):
     if not req:
         await cb.answer("So'rov topilmadi yoki o'chirib yuborilgan.", show_alert=True)
         return
-    if req[4] != "pending":
-        await cb.answer(f"Bu so'rov allaqachon '{req[4]}' holatida.", show_alert=True)
+    if req[5] != "pending":
+        await cb.answer(f"Bu so'rov allaqachon '{req[5]}' holatida.", show_alert=True)
         return
 
     await state.set_state(WithdrawEdit.WAITING_TEXT)
@@ -1047,7 +1449,7 @@ async def withdraw_edit_send(message: Message, state: FSMContext):
         await message.answer("❌ So'rov bazadan topilmadi.", reply_markup=admin_menu)
         return
 
-    r_id, user_id, amount, ff_id, status, created_at, processed_at, processed_by, old_note = req
+    r_id, user_id, amount, ff_id, game, status, created_at, processed_at, processed_by, old_note = req
     if status != "pending":
         await state.clear()
         await message.answer(f"ℹ️ Bu so'rov allaqachon '{status}' holatiga o'tkazilgan.", reply_markup=admin_menu)
@@ -1056,7 +1458,7 @@ async def withdraw_edit_send(message: Message, state: FSMContext):
     try:
         await bot.send_message(
             user_id,
-            f"✏️ Almaz yechish so'rovi bo'yicha xabar:\n\n{note}"
+            f"✏️ Pul yechish so'rovi bo'yicha xabar:\n\n{note}"
         )
     except Exception:
         pass
@@ -1073,9 +1475,10 @@ async def withdraw_edit_send(message: Message, state: FSMContext):
 
 # ============== ADMIN PANEL ==============
 @dp.message(Command("admin"))
-async def admin_panel(message: Message):
+async def admin_panel(message: Message, state: FSMContext):
     if not await is_owner_or_admin(message.from_user.id):
         return await message.answer("🚫 Siz admin emassiz.")
+    await set_menu_state(state, "admin", "main")
     await message.answer("👑 <b>Admin panel</b>", parse_mode="HTML", reply_markup=admin_menu)
 
 
@@ -1100,7 +1503,7 @@ async def proof_channel_prompt(message: Message, state: FSMContext):
     current_text = f"<code>{current}</code>" if current else "❌ Sozlanmagan"
     info = (
         "📜 <b>Isbotlar kanali</b>\n\n"
-        "Bot tasdiqlangan almaz yechish cheklarining nusxasini shu kanalda joylaydi.\n"
+        "Bot tasdiqlangan Pul yechish cheklarining nusxasini shu kanalda joylaydi.\n"
         "Botni kanalga admin qiling va <b>@username</b> yoki <b>-100...</b> ID yuboring.\n"
         "Sozlamani o'chirish uchun <b>0</b> yuboring.\n"
         "Bekor qilish uchun <b>⬅️ Orqaga</b> tugmasidan foydalaning.\n\n"
@@ -1116,6 +1519,7 @@ async def proof_channel_cancel(message: Message, state: FSMContext):
     if not await is_owner_or_admin(message.from_user.id):
         return
     await state.clear()
+    await set_menu_state(state, "admin", "main")
     await message.answer("⏎ Isbotlar kanali sozlamalari bekor qilindi.", reply_markup=admin_menu)
 
 
@@ -1133,12 +1537,14 @@ async def proof_channel_save(message: Message, state: FSMContext):
     await state.clear()
     if normalized is None:
         await delete_setting(PROOF_CHANNEL_SETTING_KEY)
+        await set_menu_state(state, "admin", "main")
         await message.answer("ℹ️ Isbotlar kanali o'chirildi.", reply_markup=admin_menu)
         return
 
     await set_setting(PROOF_CHANNEL_SETTING_KEY, normalized)
     url_hint = build_proof_channel_url(normalized)
     extra = f"\n🔗 Havola: {url_hint}" if url_hint else "\nℹ️ Kanal ID ko'rinishida saqlandi."
+    await set_menu_state(state, "admin", "main")
     await message.answer(
         "✅ Isbotlar kanali yangilandi.\n"
         f"Saqlangan qiymat: <code>{normalized}</code>{extra}",
@@ -1156,13 +1562,89 @@ async def edit_news(message: Message, state: FSMContext):
     await message.answer("📰 Yangi yangilik xabarini yuboring (matn yoki media).", reply_markup=back_kb)
 
 
-@dp.message(F.text == "💰 Almaz sotib olish matni")
+@dp.message(F.text.in_(["💰 achko sotib olish matni", "💰 Almaz sotib olish matni"]))
 async def edit_buy_text(message: Message, state: FSMContext):
     if not await is_owner_or_admin(message.from_user.id):
         return
     await state.set_state(TextEdit.new_text)
     await state.update_data(section="almaz_buy")
-    await message.answer("💰 Almaz sotib olish bo'limi uchun matn yuboring:", reply_markup=back_kb)
+    await message.answer("💰 Achko do'koni bo'limi uchun matn yuboring:", reply_markup=back_kb)
+
+
+@dp.message(F.text == "🟢 achko sotib olish matni")
+async def edit_purchase_text(message: Message, state: FSMContext):
+    if not await is_owner_or_admin(message.from_user.id):
+        return
+    await state.set_state(TextEdit.new_text)
+    await state.update_data(section="achko_purchase")
+    await message.answer(
+        "🟢 Achko sotib olish bo'limi uchun matn yuboring.\n"
+        "ID: <code>{user_id}</code> yoki <code>{user.id}</code>\n"
+        "Karta: <code>{card_number}</code>\n"
+        "Ism: <code>{card_holder}</code>",
+        parse_mode="HTML",
+        reply_markup=back_kb
+    )
+
+
+@dp.message(F.text == "💳 Karta raqami")
+async def card_number_prompt(message: Message, state: FSMContext):
+    if not await is_owner_or_admin(message.from_user.id):
+        return
+    await state.set_state(PaymentSetup.CARD)
+    await message.answer(
+        "Yangi karta raqamini yuboring.\n"
+        "O'chirish uchun <b>0</b> yuboring.",
+        parse_mode="HTML",
+        reply_markup=back_kb
+    )
+
+
+@dp.message(F.text == "👤 Karta egasi")
+async def card_holder_prompt(message: Message, state: FSMContext):
+    if not await is_owner_or_admin(message.from_user.id):
+        return
+    await state.set_state(PaymentSetup.HOLDER)
+    await message.answer(
+        "Karta egasi (ism familiya) yuboring.\n"
+        "O'chirish uchun <b>0</b> yuboring.",
+        parse_mode="HTML",
+        reply_markup=back_kb
+    )
+
+
+@dp.message(StateFilter(PaymentSetup.CARD))
+async def card_number_save(message: Message, state: FSMContext):
+    if not await is_owner_or_admin(message.from_user.id):
+        return
+    text = (message.text or "").strip()
+    if text == "⬅️ Orqaga":
+        await state.clear()
+        return await message.answer("⏎ Bekor qilindi.", reply_markup=admin_menu)
+    if text == "0":
+        await delete_setting("card_number")
+        await state.clear()
+        return await message.answer("✅ Karta raqami o'chirildi (default qaytadi).", reply_markup=admin_menu)
+    await set_setting("card_number", text)
+    await state.clear()
+    await message.answer("✅ Karta raqami yangilandi.", reply_markup=admin_menu)
+
+
+@dp.message(StateFilter(PaymentSetup.HOLDER))
+async def card_holder_save(message: Message, state: FSMContext):
+    if not await is_owner_or_admin(message.from_user.id):
+        return
+    text = (message.text or "").strip()
+    if text == "⬅️ Orqaga":
+        await state.clear()
+        return await message.answer("⏎ Bekor qilindi.", reply_markup=admin_menu)
+    if text == "0":
+        await delete_setting("card_holder")
+        await state.clear()
+        return await message.answer("✅ Karta egasi o'chirildi (default qaytadi).", reply_markup=admin_menu)
+    await set_setting("card_holder", text)
+    await state.clear()
+    await message.answer("✅ Karta egasi yangilandi.", reply_markup=admin_menu)
 
 
 @dp.message(F.text == "⬅️ Orqaga", StateFilter(TextEdit.new_text))
@@ -1170,6 +1652,7 @@ async def cancel_text_edit(message: Message, state: FSMContext):
     if not await is_owner_or_admin(message.from_user.id):
         return
     await state.clear()
+    await set_menu_state(state, "admin", "main")
     await message.answer("⏎ O'zgartirish bekor qilindi.", reply_markup=admin_menu)
 
 
@@ -1185,10 +1668,17 @@ async def save_dynamic_text(message: Message, state: FSMContext):
         else:
             await update_dynamic_text("news", f"MSG:{message.chat.id}:{message.message_id}")
         await state.clear()
+        await set_menu_state(state, "admin", "main")
         return await message.answer("✅ Yangilik xabari yangilandi.", reply_markup=admin_menu)
     if section == "almaz_buy":
         await update_dynamic_text("almaz_buy", message.text or "")
         await state.clear()
+        await set_menu_state(state, "admin", "main")
+        return await message.answer("✅ Matn yangilandi.", reply_markup=admin_menu)
+    if section == "achko_purchase":
+        await update_dynamic_text("achko_purchase", message.text or "")
+        await state.clear()
+        await set_menu_state(state, "admin", "main")
         return await message.answer("✅ Matn yangilandi.", reply_markup=admin_menu)
 
 
@@ -1205,6 +1695,7 @@ async def cancel_broadcast(message: Message, state: FSMContext):
     if not await is_owner_or_admin(message.from_user.id):
         return
     await state.clear()
+    await set_menu_state(state, "admin", "main")
     await message.answer("⏎ Reklama yuborish bekor qilindi.", reply_markup=admin_menu)
 
 
@@ -1240,6 +1731,7 @@ async def handle_broadcast(message: Message, state: FSMContext):
         f"✅ Reklama yakunlandi!\n📬 Yuborilgan: <b>{success}</b>\n❌ Yetkazilmagan: <b>{failed}</b>\n👥 Jami: <b>{total}</b>",
         parse_mode="HTML", reply_markup=admin_menu
     )
+    await set_menu_state(state, "admin", "main")
 
 
 @dp.message(F.text == "🧩 Majburiy kanallar")
@@ -1251,10 +1743,90 @@ async def channels_menu(message: Message, state: FSMContext):
     kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="➕ Kanal qo'shish"), KeyboardButton(text="➖ Kanal o'chirish")],
-            [KeyboardButton(text="⬅️ Chiqish")]
+            [KeyboardButton(text="⬅️ Orqaga")]
         ], resize_keyboard=True
     )
+    await set_menu_state(state, "channels", "admin")
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+@dp.message(F.text == "🎯 Withdraw takliflar")
+async def offers_menu(message: Message, state: FSMContext):
+    if not await is_owner_or_admin(message.from_user.id):
+        return
+    # show offers for both games
+    ff_offers = await list_offers("ff")
+    pubg_offers = await list_offers("pubg")
+    text = "🎯 <b>Withdraw takliflar</b>\n\n"
+    text += "<b>Free Fire:</b>\n" + ("\n".join(f"• {o[1]} — {o[2]} som (ID: {o[0]})" for o in ff_offers) if ff_offers else "– Hozircha yo'q.")
+    text += "\n\n<b>PUBG:</b>\n" + ("\n".join(f"• {o[1]} — {o[2]} som (ID: {o[0]})" for o in pubg_offers) if pubg_offers else "– Hozircha yo'q.")
+
+    kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="➕ Taklif qo'shish"), KeyboardButton(text="➖ Taklif o'chirish")],
+        [KeyboardButton(text="⬅️ Orqaga")]
+    ], resize_keyboard=True)
+
+    await set_menu_state(state, "offers", "admin")
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+@dp.message(F.text == "➕ Taklif qo'shish")
+async def offer_add_prompt(message: Message, state: FSMContext):
+    if not await is_owner_or_admin(message.from_user.id):
+        return
+    await state.set_state(OfferManage.ADD)
+    await message.answer(
+        "Yangi taklif qo'shish — format:\n<code>game|label|som_cost</code>\nMasalan: <code>ff|105 Almaz|105</code>",
+        parse_mode="HTML",
+        reply_markup=back_kb
+    )
+
+
+@dp.message(StateFilter(OfferManage.ADD))
+async def offer_add_exec(message: Message, state: FSMContext):
+    if not await is_owner_or_admin(message.from_user.id):
+        return
+    if (message.text or "").strip() == "⬅️ Orqaga":
+        await state.clear()
+        return await message.answer("⏎ Bekor qilindi.", reply_markup=admin_menu)
+    parts = (message.text or "").split("|")
+    if len(parts) != 3:
+        return await message.answer("⚠️ Format noto'g'ri. Iltimos: game|label|achko_cost")
+    game = parts[0].strip()
+    label = parts[1].strip()
+    try:
+        cost = int(parts[2].strip())
+    except Exception:
+        return await message.answer("⚠️ Cost raqam bo'lishi kerak.")
+
+    await create_offer(game, label, cost)
+    await state.clear()
+    await set_menu_state(state, "admin", "main")
+    await message.answer("✅ Taklif qo'shildi.", reply_markup=admin_menu)
+
+
+@dp.message(F.text == "➖ Taklif o'chirish")
+async def offer_remove_prompt(message: Message, state: FSMContext):
+    if not await is_owner_or_admin(message.from_user.id):
+        return
+    await state.set_state(OfferManage.REMOVE)
+    await message.answer("O'chirish uchun taklif ID yuboring:", reply_markup=back_kb)
+
+
+@dp.message(StateFilter(OfferManage.REMOVE))
+async def offer_remove_exec(message: Message, state: FSMContext):
+    if not await is_owner_or_admin(message.from_user.id):
+        return
+    if (message.text or "").strip() == "⬅️ Orqaga":
+        await state.clear()
+        return await message.answer("⏎ Bekor qilindi.", reply_markup=admin_menu)
+    if not (message.text or "").strip().isdigit():
+        return await message.answer("⚠️ ID raqam bo'lishi kerak.")
+    oid = int(message.text.strip())
+    ok = await delete_offer(oid)
+    await state.clear()
+    await set_menu_state(state, "admin", "main")
+    await message.answer("✅ O'chirildi." if ok else "ℹ️ Bunday taklif topilmadi.", reply_markup=admin_menu)
 
 
 @dp.message(F.text == "➕ Kanal qo'shish")
@@ -1280,6 +1852,7 @@ async def channel_add(message: Message, state: FSMContext):
         return await message.answer("⚠️ Iltimos, @username yoki -100... chat ID yuboring.")
     ok = await add_required_channel(ch)
     await state.clear()
+    await set_menu_state(state, "admin", "main")
     if ok:
         await message.answer("✅ Kanal qo'shildi.", reply_markup=admin_menu)
     else:
@@ -1304,6 +1877,7 @@ async def channel_remove(message: Message, state: FSMContext):
         return await message.answer("⏎ Bekor qilindi.", reply_markup=admin_menu)
     ok = await remove_required_channel(ch)
     await state.clear()
+    await set_menu_state(state, "admin", "main")
     if ok:
         await message.answer("✅ Kanal o'chirildi.", reply_markup=admin_menu)
     else:
@@ -1311,17 +1885,18 @@ async def channel_remove(message: Message, state: FSMContext):
 
 
 @dp.message(F.text == "🛡 Admin boshqaruvi")
-async def admin_manage_menu(message: Message):
+async def admin_manage_menu(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         return await message.answer("🚫 Bu bo'lim faqat egasi uchun.")
     admins = await list_admins()
-    text = "🛡 <b>Adminlar ro'yxati:</b>\n" + ("\n".join(f"• @{u or 'unknown'} – <code>{uid}</code>" for uid, u in admins) if admins else "– Hech kim yo'q.")
+    text = "🛡 Adminlar ro'yxati:\n" + ("\n".join(f"• @{u or 'unknown'} – {uid}" for uid, u in admins) if admins else "– Hech kim yo'q.")
     kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="👤 Admin qo'shish"), KeyboardButton(text="🗑 Adminni o'chirish")],
-            [KeyboardButton(text="⬅️ Chiqish")]
+            [KeyboardButton(text="⬅️ Orqaga")]
         ], resize_keyboard=True
     )
+    await set_menu_state(state, "admin_manage", "admin")
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
@@ -1345,6 +1920,7 @@ async def admin_add_exec(message: Message, state: FSMContext):
     uid = int(message.text)
     ok = await add_admin(uid, None)
     await state.clear()
+    await set_menu_state(state, "admin", "main")
     await message.answer("✅ Admin qo'shildi." if ok else "ℹ️ Bu foydalanuvchi allaqachon admin.", reply_markup=admin_menu)
 
 
@@ -1368,79 +1944,150 @@ async def admin_remove_exec(message: Message, state: FSMContext):
     uid = int(message.text)
     ok = await remove_admin(uid)
     await state.clear()
+    await set_menu_state(state, "admin", "main")
     await message.answer("✅ Admin o'chirildi." if ok else "ℹ️ Bunday admin topilmadi.", reply_markup=admin_menu)
 
 
-@dp.message(F.text == "💎 Qo'lda almaz berish")
-async def give_almaz_prompt(message: Message, state: FSMContext):
+@dp.message(F.text.in_(["➕ Pul berish", "💎 Qo'lda almaz berish"]))
+async def achko_add_prompt(message: Message, state: FSMContext):
     if not await is_owner_or_admin(message.from_user.id):
         return
-    await state.set_state(GiveAlmaz.WAIT)
+    await state.set_state(AdjustAchko.ADD)
     await message.answer(
-        "Bu bo'limda foydalanuvchilarga qo'lda Almaz berishingiz mumkin.\n\n"
-        "ID va Almaz miqdorini quyidagi ko'rinishda yuboring:\n"
-        "<code>123456789 10</code>  (ID + Almaz miqdori)",
+        "so'm qo‘shish — format:\n"
+        "<code>user_id: 13200</code>\n"
+        "Masalan: <code>123456789: 5000</code>",
         parse_mode="HTML",
         reply_markup=back_kb
     )
 
 
-@dp.message(StateFilter(GiveAlmaz.WAIT))
-async def give_almaz_exec(message: Message, state: FSMContext):
+@dp.message(F.text == "➖ achko olib tashlash")
+async def achko_remove_prompt(message: Message, state: FSMContext):
+    if not await is_owner_or_admin(message.from_user.id):
+        return
+    await state.set_state(AdjustAchko.REMOVE)
+    await message.answer(
+        "so'm olib tashlash — format:\n"
+        "<code>user_id: 13200</code>\n"
+        "Masalan: <code>123456789: 500</code>",
+        parse_mode="HTML",
+        reply_markup=back_kb
+    )
+
+
+@dp.message(StateFilter(AdjustAchko.ADD))
+async def achko_add_exec(message: Message, state: FSMContext):
     if not await is_owner_or_admin(message.from_user.id):
         return
     text = (message.text or "").strip()
     if text == "⬅️ Orqaga":
         await state.clear()
-        return await message.answer("⏎ Amaliyot bekor qilindi.", reply_markup=admin_menu)
+        return await message.answer("⏎ Bekor qilindi.", reply_markup=admin_menu)
 
-    parts = text.split()
-    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+    parsed = parse_user_amount(text)
+    if not parsed:
         return await message.answer(
-            "⚠️ Iltimos, formatga rioya qiling:\n"
-            "<code>ID MIQDOR</code>\nMasalan: <code>123456789 10</code>",
+            "⚠️ Format noto'g'ri.\n"
+            "<code>user_id: 13200</code> ko'rinishida yuboring.",
             parse_mode="HTML"
         )
 
-    user_id = int(parts[0])
-    amount = int(parts[1])
+    user_id, amount = parsed
+    if amount <= 0:
+        return await message.answer("⚠️ Miqdor musbat bo'lishi kerak.")
 
-    from database import DB_NAME
-    import aiosqlite
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute("SELECT username, almaz FROM users WHERE user_id=?", (user_id,))
-        row = await cur.fetchone()
-
-    if not row:
+    user = await get_user(user_id)
+    if not user:
         return await message.answer("❌ Bunday foydalanuvchi bazada topilmadi.")
 
-    await add_almaz(user_id, amount)
+    ok = await adjust_balance(user_id, amount, min_zero=False)
+    if not ok:
+        return await message.answer("❌ Balansni yangilashda xatolik.")
+
+    await log_admin_action(message.from_user.id, "achko_add", user_id, amount, None)
+    updated = await get_user(user_id)
+    balance = updated[3] if updated and len(updated) > 3 and updated[3] is not None else 0
     await state.clear()
 
     try:
         await bot.send_message(
             user_id,
-            f"🎁 Sizga bot administratori tomonidan <b>{amount} Almaz</b> taqdim qilindi! Tabriklaymiz 🎉",
+            f"🎁 Sizga bot administratori tomonidan <b>{amount} som</b> qo'shildi!",
             parse_mode="HTML"
         )
     except Exception:
         pass
 
     await message.answer(
-        f"✅ <code>{user_id}</code> foydalanuvchi hisobiga {amount} Almaz qo'shildi.",
+        f"✅ <code>{user_id}</code> foydalanuvchi hisobiga {amount}som qo'shildi.\n"
+        f"💎 Yangi balans: <b>{balance} som</b>",
+        parse_mode="HTML",
+        reply_markup=admin_menu
+    )
+
+
+@dp.message(StateFilter(AdjustAchko.REMOVE))
+async def achko_remove_exec(message: Message, state: FSMContext):
+    if not await is_owner_or_admin(message.from_user.id):
+        return
+    text = (message.text or "").strip()
+    if text == "⬅️ Orqaga":
+        await state.clear()
+        return await message.answer("⏎ Bekor qilindi.", reply_markup=admin_menu)
+
+    parsed = parse_user_amount(text)
+    if not parsed:
+        return await message.answer(
+            "⚠️ Format noto'g'ri.\n"
+            "<code>user_id: 13200</code> ko'rinishida yuboring.",
+            parse_mode="HTML"
+        )
+
+    user_id, amount = parsed
+    if amount <= 0:
+        return await message.answer("⚠️ Miqdor musbat bo'lishi kerak.")
+
+    user = await get_user(user_id)
+    if not user:
+        return await message.answer("❌ Bunday foydalanuvchi bazada topilmadi.")
+
+    ok = await adjust_balance(user_id, -amount, min_zero=True)
+    if not ok:
+        return await message.answer("❌ Balans yetarli emas yoki xatolik yuz berdi.")
+
+    await log_admin_action(message.from_user.id, "achko_remove", user_id, amount, None)
+    updated = await get_user(user_id)
+    balance = updated[3] if updated and len(updated) > 3 and updated[3] is not None else 0
+    await state.clear()
+
+    try:
+        await bot.send_message(
+            user_id,
+            f"⚠️ Hisobingizdan <b>{amount} som</b> olib tashlandi.",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+    await message.answer(
+        f"✅ <code>{user_id}</code> foydalanuvchi hisobidan {amount} som olib tashlandi.\n"
+        f"💎 Yangi balans: <b>{balance} som</b>",
         parse_mode="HTML",
         reply_markup=admin_menu
     )
 
 
 @dp.message(F.text == "💾 Backup yaratish")
-async def create_backup(message: Message):
+async def create_backup(message: Message, state: FSMContext):
     if not await is_owner_or_admin(message.from_user.id):
         return
     result = await backup_database()
     if result.startswith("Backup xatosi"):
+        await set_menu_state(state, "admin", "main")
         await message.answer(f"❌ {result}", reply_markup=admin_menu)
     else:
+        await set_menu_state(state, "admin", "main")
         await message.answer(
             f"✅ Baza muvaffaqiyatli zaxiralandi!\n📁 Fayl: <code>{result}</code>",
             parse_mode="HTML",
@@ -1448,14 +2095,14 @@ async def create_backup(message: Message):
         )
 
 
-@dp.message(F.text == "🔧 Referal almaz qiymati")
+@dp.message(F.text.in_(["🔧 Referal mukofoti (so'm)", "🔧 Referal almaz qiymati"]))
 async def change_ref_reward(message: Message, state: FSMContext):
     if not await is_owner_or_admin(message.from_user.id):
         return
     current = await get_referral_reward()
     await state.set_state("WAITING_REF_REWARD")
     await message.answer(
-        f"🔧 Hozirgi referal mukofoti: <b>{current} Almaz</b>\n\n"
+        f"🔧 Hozirgi referal mukofoti: <b>{current} som</b>\n\n"
         "Yangi qiymatni kiriting (faqat raqam):",
         parse_mode="HTML",
         reply_markup=back_kb
@@ -1479,7 +2126,7 @@ async def save_new_ref_reward(message: Message, state: FSMContext):
 
     await state.clear()
     await message.answer(
-        f"✅ Referal mukofoti yangilandi: <b>{value} Almaz</b>",
+        f"✅ Referal mukofoti yangilandi: <b>{value} som</b>",
         parse_mode="HTML",
         reply_markup=admin_menu
     )
@@ -1502,7 +2149,7 @@ async def show_stats(message: Message):
             uname = f"@{username}" if username else f"ID:{uid}"
             text += f"{i}. {uname} – {cnt} ta tasdiqlangan referal\n"
 
-    text += "\n💳 <b>Almaz yechish so'rovlari</b>:\n"
+    text += "\n💳 <b>som yechish so'rovlari</b>:\n"
     text += f"• Umumiy so'rovlar: <b>{total}</b>\n"
     text += f"• Tasdiqlangan: <b>{approved}</b>\n"
     text += f"• Tahrirlangan: <b>{edited}</b>\n"
@@ -1549,7 +2196,7 @@ async def top_user_profile(cb: CallbackQuery):
         f"🆔 ID: <code>{uid}</code>\n"
         f"👤 Username: @{user[1] or 'Anonim'}\n"
         f"📞 Telefon: {phone or '–'}\n"
-        f"💎 Almaz: {almaz}\n"
+        f"💎 Balans: {almaz}\n so'm"
         f"🤝 Tasdiqlangan takliflar: {total_refs_verified}\n"
         f"⏳ Tanaffus (qolgan): {remain} s\n"
     )
@@ -1619,6 +2266,7 @@ async def search_user_cancel(message: Message, state: FSMContext):
     if not await is_owner_or_admin(message.from_user.id):
         return
     await state.clear()
+    await set_menu_state(state, "admin", "main")
     await message.answer("⏎ Qidiruv bekor qilindi.", reply_markup=admin_menu)
 
 
@@ -1661,14 +2309,20 @@ async def search_user_exec(message: Message, state: FSMContext):
         f"👤 <b>Username:</b> @{username or 'Anonim'}\n"
         f"📞 <b>Telefon:</b> {phone or '—'}\n"
         f"✅ <b>Verified:</b> {'Ha' if (verified or 0) else 'Yo‘q'}\n"
-        f"💎 <b>Almaz:</b> {almaz or 0}\n"
+        f"💎 <b>:<valansi /b> {almaz or 0} som\n"
         f"🤝 <b>Referal soni (ref_by bilan):</b> {ref_cnt}\n"
         f"🕒 <b>Ro‘yxatdan o‘tgan:</b> {first_seen}\n"
         f"⏳ <b>Tanaffus (qolgan):</b> {remain} s\n"
     )
     
     await state.clear()
+    await set_menu_state(state, "admin", "main")
     await message.answer(txt, parse_mode="HTML", reply_markup=admin_menu)
+
+
+@dp.message(F.text == "⬅️ Orqaga")
+async def back_to_previous_menu(message: Message, state: FSMContext):
+    await go_back_menu(message, state)
 
 
 @dp.message(F.text == "⬅️ Chiqish")

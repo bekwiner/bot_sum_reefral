@@ -61,6 +61,7 @@ CREATE_SQL = [
         user_id      INTEGER NOT NULL,
         amount       INTEGER NOT NULL,
         ff_id        TEXT,
+        game         TEXT DEFAULT 'ff',
         status       TEXT DEFAULT 'pending',
         created_at   INTEGER,
         processed_at INTEGER,
@@ -80,6 +81,42 @@ CREATE_SQL = [
     CREATE TABLE IF NOT EXISTS settings (
         key   TEXT PRIMARY KEY,
         value TEXT
+    );
+    """
+    ,
+    """
+    CREATE TABLE IF NOT EXISTS offers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        game TEXT NOT NULL,
+        label TEXT NOT NULL,
+        achko_cost INTEGER NOT NULL,
+        created_at INTEGER
+    );
+    """
+    ,
+    """
+    CREATE TABLE IF NOT EXISTS purchases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        amount INTEGER NOT NULL,
+        proof_chat_id INTEGER,
+        proof_message_id INTEGER,
+        status TEXT DEFAULT 'pending',
+        created_at INTEGER,
+        processed_at INTEGER,
+        processed_by INTEGER,
+        note TEXT
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS admin_actions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        admin_id INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        target_user_id INTEGER,
+        amount INTEGER,
+        note TEXT,
+        created_at INTEGER
     );
     """
 ]
@@ -139,6 +176,17 @@ async def init_db():
         for sql in CREATE_SQL:
             await db.execute(sql)
         await db.commit()
+    await _ensure_column("withdraw_requests", "game", "TEXT DEFAULT 'ff'")
+
+
+async def _ensure_column(table: str, column: str, ddl: str):
+    async with db_connection() as db:
+        cur = await db.execute(f"PRAGMA table_info({table})")
+        rows = await cur.fetchall()
+        cols = [r[1] for r in rows]
+        if column not in cols:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            await db.commit()
 
 
 # ---------------- Users ----------------
@@ -182,15 +230,50 @@ async def add_almaz(user_id: int, amount: int):
         await db.commit()
 
 
+async def adjust_balance(user_id: int, delta: int, min_zero: bool = True) -> bool:
+    async with db_connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("SELECT COALESCE(almaz,0) FROM users WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        if not row:
+            await db.rollback()
+            return False
+        balance = int(row[0])
+        new_balance = balance + delta
+        if min_zero and new_balance < 0:
+            await db.rollback()
+            return False
+        await db.execute("UPDATE users SET almaz=? WHERE user_id=?", (new_balance, user_id))
+        await db.commit()
+        return True
+
+
 async def get_leaderboard(limit: int = 15) -> List[Tuple[str, int]]:
     async with db_connection() as db:
         cur = await db.execute("""
-            SELECT username, almaz FROM users
-            ORDER BY almaz DESC, user_id ASC
+            SELECT username, COALESCE(almaz,0) FROM users
+            ORDER BY COALESCE(almaz,0) DESC, user_id ASC
             LIMIT ?
         """, (limit,))
         rows = await cur.fetchall()
         return [(r[0], r[1]) for r in rows]
+
+
+async def get_user_rank(user_id: int) -> Tuple[int, int]:
+    async with db_connection() as db:
+        cur = await db.execute("SELECT COUNT(*) FROM users")
+        total_row = await cur.fetchone()
+        total = int(total_row[0]) if total_row else 0
+
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM users WHERE COALESCE(almaz,0) > (SELECT COALESCE(almaz,0) FROM users WHERE user_id=?)",
+            (user_id,)
+        )
+        higher = await cur.fetchone()
+        higher_count = int(higher[0]) if higher else 0
+
+        rank = higher_count + 1 if total > 0 else 0
+        return rank, total
 
 
 async def get_ref_by(user_id: int) -> Optional[int]:
@@ -434,17 +517,117 @@ async def get_top_referrers_today(limit: int = 10) -> List[Tuple[int, Optional[s
         rows = await cur.fetchall()
         return [(r[0], r[1], r[2]) for r in rows]
 
+# ---------------- Offers ----------------
+async def create_offer(game: str, label: str, achko_cost: int):
+    now = int(time.time())
+    async with db_connection() as db:
+        cur = await db.execute(
+            "INSERT INTO offers(game, label, achko_cost, created_at) VALUES(?, ?, ?, ?)",
+            (game, label, achko_cost, now)
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def list_offers(game: str) -> List[Tuple[int, str, int]]:
+    async with db_connection() as db:
+        cur = await db.execute(
+            "SELECT id, label, achko_cost FROM offers WHERE game=? ORDER BY achko_cost ASC",
+            (game,)
+        )
+        rows = await cur.fetchall()
+        return [(r[0], r[1], r[2]) for r in rows]
+
+
+async def get_offer(offer_id: int):
+    async with db_connection() as db:
+        cur = await db.execute("SELECT id, game, label, achko_cost FROM offers WHERE id=?", (offer_id,))
+        return await cur.fetchone()
+
+
+async def update_offer(offer_id: int, label: str, achko_cost: int):
+    async with db_connection() as db:
+        await db.execute("UPDATE offers SET label=?, achko_cost=? WHERE id=?", (label, achko_cost, offer_id))
+        await db.commit()
+
+
+async def delete_offer(offer_id: int):
+    async with db_connection() as db:
+        cur = await db.execute("DELETE FROM offers WHERE id=?", (offer_id,))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+# ---------------- Purchases ----------------
+async def create_purchase(user_id: int, amount: int, proof_chat_id: int, proof_message_id: int):
+    now = int(time.time())
+    async with db_connection() as db:
+        cur = await db.execute(
+            "INSERT INTO purchases(user_id, amount, proof_chat_id, proof_message_id, status, created_at) VALUES(?, ?, ?, ?, 'pending', ?)",
+            (user_id, amount, proof_chat_id, proof_message_id, now)
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def list_pending_purchases() -> List[Tuple[int, int, int, int]]:
+    async with db_connection() as db:
+        cur = await db.execute(
+            "SELECT id, user_id, amount, created_at FROM purchases WHERE status='pending' ORDER BY created_at ASC"
+        )
+        return await cur.fetchall()
+
+
+async def update_purchase_status(purchase_id: int, status: str, processed_by: int | None, note: str | None = None):
+    now = int(time.time())
+    async with db_connection() as db:
+        if note is not None:
+            await db.execute(
+                "UPDATE purchases SET status=?, processed_at=?, processed_by=?, note=? WHERE id=?",
+                (status, now, processed_by, note, purchase_id)
+            )
+        else:
+            await db.execute(
+                "UPDATE purchases SET status=?, processed_at=?, processed_by=? WHERE id=?",
+                (status, now, processed_by, purchase_id)
+            )
+        await db.commit()
+
+
+# ---------------- Atomic withdraw + deduct ----------------
+async def create_withdraw_and_deduct(user_id: int, amount: int, ff_id: str, game: str = "ff"):
+    now = int(time.time())
+    async with db_connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("SELECT COALESCE(almaz,0) FROM users WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        if not row:
+            await db.rollback()
+            return None
+        balance = int(row[0])
+        if balance < amount:
+            await db.rollback()
+            return None
+
+        await db.execute("UPDATE users SET almaz = almaz - ? WHERE user_id=?", (amount, user_id))
+        cur = await db.execute(
+            "INSERT INTO withdraw_requests(user_id, amount, ff_id, game, status, created_at) VALUES(?, ?, ?, ?, 'pending', ?)",
+            (user_id, amount, ff_id, game, now)
+        )
+        await db.commit()
+        return cur.lastrowid
+
 
 # ---------------- Withdraw ----------------
-async def create_withdraw_request(user_id: int, amount: int, ff_id: str) -> int:
+async def create_withdraw_request(user_id: int, amount: int, ff_id: str, game: str = "ff") -> int:
     now = int(time.time())
     async with db_connection() as db:
         cur = await db.execute(
             """
-            INSERT INTO withdraw_requests(user_id, amount, ff_id, status, created_at)
-            VALUES(?, ?, ?, 'pending', ?)
+            INSERT INTO withdraw_requests(user_id, amount, ff_id, game, status, created_at)
+            VALUES(?, ?, ?, ?, 'pending', ?)
             """,
-            (user_id, amount, ff_id, now)
+            (user_id, amount, ff_id, game, now)
         )
         await db.commit()
         return cur.lastrowid
@@ -454,7 +637,7 @@ async def get_withdraw_request(request_id: int):
     async with db_connection() as db:
         cur = await db.execute(
             """
-            SELECT id, user_id, amount, ff_id, status, created_at, processed_at, processed_by, note
+            SELECT id, user_id, amount, ff_id, game, status, created_at, processed_at, processed_by, note
             FROM withdraw_requests
             WHERE id=?
             """,
@@ -519,6 +702,26 @@ async def get_withdraw_notifications(request_id: int) -> List[Tuple[int, int]]:
         )
         rows = await cur.fetchall()
         return [(r[0], r[1]) for r in rows]
+
+
+# ---------------- Admin actions ----------------
+async def log_admin_action(
+    admin_id: int,
+    action: str,
+    target_user_id: Optional[int] = None,
+    amount: Optional[int] = None,
+    note: Optional[str] = None
+):
+    now = int(time.time())
+    async with db_connection() as db:
+        await db.execute(
+            """
+            INSERT INTO admin_actions(admin_id, action, target_user_id, amount, note, created_at)
+            VALUES(?, ?, ?, ?, ?, ?)
+            """,
+            (admin_id, action, target_user_id, amount, note, now)
+        )
+        await db.commit()
 
 
 # ---------------- Settings ----------------
